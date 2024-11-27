@@ -274,6 +274,7 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(self, req: Req):
+        print(f"rem_total_tokens: {self.rem_total_tokens}, rem_input_tokens: {self.rem_input_tokens}, rem_chunk_tokens: {self.rem_chunk_tokens}")
         if req.sampling_params.ignore_eos and self.tree_cache.disable:
             return self.add_one_req_ignore_eos(req)
 
@@ -290,6 +291,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
+            print(f"we need {total_tokens} tokens, but only have {self.rem_total_tokens} tokens left")
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 

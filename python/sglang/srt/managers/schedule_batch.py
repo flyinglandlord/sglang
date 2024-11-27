@@ -250,6 +250,17 @@ class Req:
 
         # For Qwen2-VL
         self.mrope_position_delta = []  # use mutable object
+    
+    def free_some_tokens(self, num_tokens):
+        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = self.fill_ids[num_tokens:]
+        self.prefix_indices = self.prefix_indices[num_tokens:]
+        self.extend_input_len -= num_tokens
+        if len(self.origin_input_ids) > num_tokens:
+            self.origin_input_ids = self.origin_input_ids[num_tokens:]
+        else:
+            self.output_ids = self.output_ids[num_tokens-len(self.origin_input_ids):]
+            self.origin_input_ids = []
 
     # whether request reached finished condition
     def finished(self) -> bool:

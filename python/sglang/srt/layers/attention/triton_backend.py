@@ -141,6 +141,17 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
         )
+        print(f"extend_attention_fwd args: {q.shape}\n{k.shape}\n{v.shape}\n{o.shape}\n\
+                {forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape}\n\
+                {forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).shape}\n\
+                {forward_batch.req_to_token_pool.req_to_token[:6, :20]}\n\
+                {forward_batch.req_pool_indices}\n\
+                {forward_batch.seq_lens}\n\
+                {forward_batch.extend_seq_lens}\n\
+                {forward_batch.extend_start_loc}\n\
+                {max_extend_len}\n\
+                {layer.scaling}\n\
+                {layer.logit_cap}\n")
         return o
 
     def forward_decode(

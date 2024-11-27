@@ -93,6 +93,67 @@ class ReqToTokenPool:
             self.req_to_token[indices] = values
 
 
+class LayerwiseReqToTokenPool(ReqToTokenPool):
+    def __init__(self, size: int, layer_num: int, max_context_len: int, device: str, use_records: bool):
+        self.size = size
+        self.layer_num = layer_num
+        self.max_context_len = max_context_len
+        self.device = device
+        self.req_to_token = torch.zeros(
+            (layer_num, size, max_context_len), dtype=torch.int32, device=device
+        )
+        self.free_slots = [list(range(size)) for _ in range(layer_num)]
+        self.write_records = []
+        self.use_records = use_records
+
+        if self.use_records:
+            self.write = self.write_with_records
+        else:
+            self.write = self.write_without_records
+
+    def write(self, indices, values):
+        # Keep the signature for type checking. It will be assigned during runtime.
+        raise NotImplementedError()
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> List[int]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+
+    def clear(self):
+        self.free_slots = [list(range(self.size)) for _ in range(self.layer_num)]
+        self.write_records = []
+
+    def write_without_records(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def write_with_records(self, indices, values):
+        self.req_to_token[indices] = values
+        self.write_records.append((indices, values))
+
+    def get_write_records(self):
+        ret = self.write_records
+        self.write_records = []
+        return ret
+
+    def apply_write_records(self, write_records: List[Tuple]):
+        for indices, values in write_records:
+            self.req_to_token[indices] = values
+
+
 class BaseTokenToKVPool:
     """A memory pool that maps a token location to its kv cache data."""
 
@@ -231,6 +292,85 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
 
+
+class NoLayerTokenToKVPool(BaseTokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+    ):
+        self.layer_num = layer_num
+        super().__init__(size, dtype, device)
+        self.k_buffer = torch.empty(
+            (size, head_num, head_dim), dtype=self.store_dtype, device=device
+        )
+        self.v_buffer = torch.empty(
+            (size, head_num, head_dim), dtype=self.store_dtype, device=device
+        )
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int):
+        # NOTE: need_size is the number of tokens, not the number of slots
+        need_size = need_size * self.layer_num
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index.to(self.device, non_blocking=True)
+
+    def free(self, free_index: torch.Tensor):
+        if self.is_not_in_free_group:
+            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.concat(self.free_group))
+
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.is_in_free_group = False
+        self.free_group = []
+    
+    def get_key_buffer(self) -> torch.Tensor:
+        return self.k_buffer
+    
+    def get_value_buffer(self) -> torch.Tensor:
+        return self.v_buffer
+
+    def get_kv_buffer(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.k_buffer, self.v_buffer
+    
+    def set_kv_buffer(
+        self,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            self.k_buffer[loc] = cache_k.view(self.store_dtype)
+            self.v_buffer[loc] = cache_v.view(self.store_dtype)
+        else:
+            self.k_buffer[loc] = cache_k
+            self.v_buffer[loc] = cache_v
 
 # This compiled version is slower in the unit test
 # python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size

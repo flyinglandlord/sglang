@@ -97,6 +97,9 @@ class Scheduler:
         tp_rank: int,
         dp_rank: Optional[int],
     ):
+        # Add some new variable for test
+        self.batch_full_count = 0
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -304,7 +307,7 @@ class Scheduler:
             if self.cur_batch is not None:
                 if self.watchdog_last_forward_ct == self.forward_ct:
                     if time.time() > self.watchdog_last_time + self.watchdog_timeout:
-                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+                        logger.error(f"Watchdog timeout ({self.watchdog_timeout})")
                         break
                 else:
                     self.watchdog_last_forward_ct = self.forward_ct
@@ -564,7 +567,6 @@ class Scheduler:
                     self.running_batch = self.last_batch
                 else:
                     self.running_batch.merge_batch(self.last_batch)
-
         # Prefill first
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
@@ -589,7 +591,14 @@ class Scheduler:
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
         ) and self.current_inflight_req is None:
-            return None
+            if self.batch_is_full:
+                self.batch_full_count += 1
+            if self.batch_full_count <= 150:
+                return None
+            else:
+                return None
+                #self.batch_full_count = 0
+                #print('schduling prefill request with memory compression...')
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
         if running_bs >= self.max_running_requests:
@@ -601,6 +610,7 @@ class Scheduler:
 
         # Prefill policy
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
+        print(self.new_token_ratio)
         adder = PrefillAdder(
             self.tree_cache,
             self.running_batch,
@@ -647,10 +657,37 @@ class Scheduler:
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
             res = adder.add_one_req(req)
+            # print(req, res)
+            def try_to_get_some_space(adder: PrefillAdder, ratio: float=0.2):
+                if self.running_batch is not None:
+                    for run_req in self.running_batch.reqs:
+                        req_to_token_pool_idx = run_req.req_pool_idx
+                        evicted_tokens = int(len(run_req.fill_ids) * ratio)
+                        # free the ratio of the tokens
+                        run_req.free_some_tokens(evicted_tokens)
+                        removed_slots = self.req_to_token_pool.req_to_token[req_to_token_pool_idx][:evicted_tokens]
+                        self.token_to_kv_pool.free(removed_slots)
+                        def shift_and_pad(tensor, num_drop=5):
+                            length = tensor.size(0)
+                            padded_tensor = torch.zeros_like(tensor)
+                            padded_tensor[:length - num_drop] = tensor[num_drop:]
+                            return padded_tensor
+                        self.req_to_token_pool.req_to_token[req_to_token_pool_idx] = shift_and_pad(
+                            self.req_to_token_pool.req_to_token[req_to_token_pool_idx], evicted_tokens
+                        )
+                        adder.rem_total_tokens += evicted_tokens
+                        # print(len(req.prefix_indices), len(req.fill_ids), self.req_to_token_pool.req_to_token[req_to_token_pool_idx][:len(req.fill_ids) + 5])
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    # try_to_get_some_space(adder, ratio=0.1)
                     self.batch_is_full = True
-                break
+                    break
+                    res = adder.add_one_req(req)
+                    if res == AddReqResult.NO_TOKEN:
+                        self.batch_is_full = True
+                        break
+                    elif res == AddReqResult.CONTINUE:
+                        print("*****can prefill after memory compress*****")
 
         # Update waiting queue
         can_run_list = adder.can_run_list
