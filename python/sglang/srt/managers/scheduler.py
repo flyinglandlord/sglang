@@ -389,7 +389,22 @@ class Scheduler:
             self.cur_batch = batch
 
             if batch:
+                if batch.forward_mode.is_mixed():
+                    print(f"mixed: {len(batch.decoding_reqs)} {len(batch.reqs) - len(batch.decoding_reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ')
+                elif batch.forward_mode.is_extend():
+                    print(f"extend: {0} {len(batch.reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ')
+                elif batch.forward_mode.is_decode():
+                    print(f"decode: {len(batch.reqs)} {0} {batch.seq_lens_sum} {len(batch.reqs)}", end=' ')
+                
+                torch.cuda.synchronize()
+                st = time.time()
+
                 result = self.run_batch(batch)
+
+                torch.cuda.synchronize()
+                ed = time.time()
+                print(f"{ed - st}")
+
                 self.process_batch_result(batch, result)
             else:
                 # Self-check and re-init some states when the server is idle

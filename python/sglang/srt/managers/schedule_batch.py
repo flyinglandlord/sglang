@@ -1204,6 +1204,12 @@ class ModelWorkerBatch:
     input_embeds: Optional[torch.tensor] = None
 
 
+@dataclasses.dataclass
+class MixModelWorkerBatch:
+    prefill_batch: ModelWorkerBatch
+    decode_batch: ModelWorkerBatch
+
+
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]

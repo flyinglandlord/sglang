@@ -28,6 +28,7 @@ from vllm.distributed import (
     set_custom_all_reduce,
 )
 
+from python.sglang.srt.layers.attention.pod_attn_backend import PODAttnBackend
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -597,6 +598,8 @@ class ModelRunner:
                 self.attn_backend = TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "pod":
+            self.attn_backend = PODAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
