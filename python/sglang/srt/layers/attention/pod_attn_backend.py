@@ -253,67 +253,98 @@ class PODAttnBackend(AttentionBackend):
 
         cu_seq_len_q = torch.cumsum(forward_batch.extend_seq_lens, dim=0).to(q.device)
         cu_seq_len_q = torch.cat([torch.tensor([0], device=cu_seq_len_q.device), cu_seq_len_q])
+        cu_seq_len_cache = torch.cumsum(forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens, dim=0).to(k.device)
+        cu_seq_len_cache = torch.cat([torch.tensor([0], device=cu_seq_len_cache.device), cu_seq_len_cache])
+
         extend_p = torch.sum(forward_batch.extend_seq_lens[:bs_p]).item()
         max_extend_p = torch.max(forward_batch.extend_seq_lens[:bs_p]).item()
-        extend_d = torch.sum(forward_batch.extend_seq_lens[bs_p:]).item()
-        q_p = torch.empty((bs_p, max_extend_p, layer.tp_q_head_num, layer.head_dim), device=q.device, dtype=torch.float16)
-        #k_p = torch.empty((bs_p, max_extend_p, layer.tp_k_head_num, layer.head_dim), device=k.device, dtype=k.dtype)
-        #v_p = torch.empty((bs_p, max_extend_p, layer.tp_v_head_num, layer.head_dim), device=v.device, dtype=v.dtype)
+        # extend_d = torch.sum(forward_batch.extend_seq_lens[bs_p:]).item()
+        q_p = torch.empty((bs_p, max_extend_p, layer.tp_q_head_num, layer.head_dim), device=q.device, dtype=q.dtype)
         select_q = torch.zeros((bs_p, max_extend_p), device=q.device, dtype=torch.bool)
         
-        for i in range(bs_p):
-            bs_len = forward_batch.extend_seq_lens[i]
-            q_p[i, :bs_len] = q[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_q_head_num, layer.head_dim)
-            select_q[i, :bs_len] = torch.ones(bs_len, device=select_q.device)
-            #k_p[i, :bs_len] = k[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
-            #v_p[i, :bs_len] = v[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_v_head_num, layer.head_dim)
-
+        # Keep the PyTorch Version
+        # for i in range(bs_p):
+        #     bs_len = forward_batch.extend_seq_lens[i]
+        #     q_p[i, :bs_len] = q[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_q_head_num, layer.head_dim)
+        #     select_q[i, :bs_len] = torch.ones(bs_len, device=select_q.device)
+        #     #k_p[i, :bs_len] = k[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
+        #     #v_p[i, :bs_len] = v[cu_seq_len_q[i]:cu_seq_len_q[i+1]].reshape(bs_len, layer.tp_v_head_num, layer.head_dim)
+        q = q.view(-1, layer.tp_q_head_num * layer.head_dim)
+        q_p = q_p.view(-1, max_extend_p, layer.tp_q_head_num * layer.head_dim)
+        reorder_q_kernel[(bs_p, (max_extend_p + 511) // 512)](
+            q, q_p, cu_seq_len_q, select_q, 
+            q.stride(0), q_p.stride(0), q_p.stride(1), select_q.stride(0)
+        )
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_p = q_p.view(-1, max_extend_p, layer.tp_q_head_num, layer.head_dim).to(torch.float16)
         q_d = q[extend_p:].reshape(bs_d, 1, layer.tp_q_head_num, layer.head_dim).to(torch.float16)
-        #k_d = k[extend_p:].reshape(bs_d, 1, layer.tp_q_head_num, layer.head_dim)
-        #v_d = v[extend_p:].reshape(bs_d, 1, layer.tp_q_head_num, layer.head_dim)
 
         # then calculate the k, v tensors
         cache_seqlens = forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
         cache_seqlens_p = forward_batch.extend_prefix_lens[:bs_p] + forward_batch.extend_seq_lens[:bs_p]
         cache_seqlens_d = forward_batch.extend_prefix_lens[bs_p:] + forward_batch.extend_seq_lens[bs_p:]
-        cu_cache_seq_len = torch.cumsum(cache_seqlens, dim=0).to(k.device)
-        cu_cache_seq_len = torch.cat([torch.tensor([0], device=cu_cache_seq_len.device), cu_cache_seq_len])
+        # cu_cache_seq_len = torch.cumsum(cache_seqlens, dim=0).to(k.device)
+        # cu_cache_seq_len = torch.cat([torch.tensor([0], device=cu_cache_seq_len.device), cu_cache_seq_len])
         max_cache_p = torch.max(cache_seqlens_p).item()
         max_cache_d = torch.max(cache_seqlens_d).item()
         k_cache_d = torch.empty((bs_d, max_cache_d, layer.tp_k_head_num, layer.head_dim), device=k.device, dtype=torch.float16)
         v_cache_d = torch.empty((bs_d, max_cache_d, layer.tp_v_head_num, layer.head_dim), device=v.device, dtype=torch.float16)
         k_cache_p = torch.empty((bs_p, max_cache_p, layer.tp_k_head_num, layer.head_dim), device=k.device, dtype=torch.float16)
         v_cache_p = torch.empty((bs_p, max_cache_p, layer.tp_v_head_num, layer.head_dim), device=v.device, dtype=torch.float16)
-
-        for i in range(bs_p):
-            bs_len = forward_batch.extend_prefix_lens[i] + forward_batch.extend_seq_lens[i]
-            cache_seqlens_p[i] = bs_len
-            k_cache_p[i, :bs_len] = \
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
-                    [self.kv_indices[cu_cache_seq_len[i]:cu_cache_seq_len[i+1]]] \
-                        .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
-            v_cache_p[i, :bs_len] = \
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id) \
-                    [self.kv_indices[cu_cache_seq_len[i]:cu_cache_seq_len[i+1]]] \
-                        .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
-        # print(cu_cache_seq_len)
-        # print(bs_d, bs_p)
-        # print(k_cache_d.shape, k_cache_p.shape)
-        for i in range(bs_d):
-            bs_len = forward_batch.extend_prefix_lens[bs_p + i] + forward_batch.extend_seq_lens[bs_p + i]
-            # print(i, bs_len, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
-            #         [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
-            #             .reshape(bs_len, layer.tp_k_head_num, layer.head_dim).shape)
-            cache_seqlens_d[i] = bs_len
-            k_cache_d[i, :bs_len] = \
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
-                    [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
-                        .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
-            v_cache_d[i, :bs_len] = \
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id) \
-                    [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
-                        .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
         
+        # Keep the PyTorch Version
+        # for i in range(bs_p):
+        #     bs_len = forward_batch.extend_prefix_lens[i] + forward_batch.extend_seq_lens[i]
+        #     cache_seqlens_p[i] = bs_len
+        #     k_cache_p[i, :bs_len] = \
+        #         forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
+        #             [self.kv_indices[cu_cache_seq_len[i]:cu_cache_seq_len[i+1]]] \
+        #                 .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
+        #     v_cache_p[i, :bs_len] = \
+        #         forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id) \
+        #             [self.kv_indices[cu_cache_seq_len[i]:cu_cache_seq_len[i+1]]] \
+        #                 .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
+        
+        reorder_kv_kernel[(bs_p, (max_cache_p + 511) // 512, layer.tp_k_head_num)](
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_indices,
+            cu_seq_len_cache[:bs_p+1],
+            k_cache_p, v_cache_p,
+            layer.head_dim,
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).stride(0),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).stride(1),
+            k_cache_p.stride(0), k_cache_p.stride(1), k_cache_p.stride(2),
+        )
+
+        # Keep the PyTorch Version
+        # for i in range(bs_d):
+        #     bs_len = forward_batch.extend_prefix_lens[bs_p + i] + forward_batch.extend_seq_lens[bs_p + i]
+        #     # print(i, bs_len, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
+        #     #         [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
+        #     #             .reshape(bs_len, layer.tp_k_head_num, layer.head_dim).shape)
+        #     cache_seqlens_d[i] = bs_len
+        #     k_cache_d[i, :bs_len] = \
+        #         forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id) \
+        #             [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
+        #                 .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
+        #     v_cache_d[i, :bs_len] = \
+        #         forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id) \
+        #             [self.kv_indices[cu_cache_seq_len[bs_p + i]:cu_cache_seq_len[bs_p + i + 1]]] \
+        #                 .reshape(bs_len, layer.tp_k_head_num, layer.head_dim)
+        
+        reorder_kv_kernel[(bs_p, (max_cache_d + 511) // 512, layer.tp_k_head_num)](
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_indices,
+            cu_seq_len_cache[bs_p:],
+            k_cache_d, v_cache_d,
+            layer.head_dim,
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).stride(0),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).stride(1),
+            k_cache_d.stride(0), k_cache_d.stride(1), k_cache_d.stride(2),
+        )
+
         o_prefill, o_decode = true_fused_attn_with_kvcache(
             q_p, k_cache_p, v_cache_p, q_d, k_cache_d, v_cache_d, 
             cache_seqlens_p=cache_seqlens_p, cache_seqlens_d=cache_seqlens_d,
@@ -814,6 +845,152 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
         return kv_indices
+        
+
+@triton.jit
+def reorder_q_kernel(
+    q_ptr,              # Pointer to the input tensor q [seq_len, hidden_size]
+    q_new_ptr,          # Pointer to the output tensor q_new [batch_size, max_seq_len, hidden_size]
+    cu_seq_len_q_ptr,   # Pointer to cumulative sequence lengths [batch_size + 1]
+    select_qp_ptr,      # Pointer to the mask tensor select_qp [batch_size, max_seq_len]
+    q_stride_0,         # Stride for the first dimension of q (usually hidden_size)
+    q_new_stride_0,     # Stride for the first dimension of q_new (usually max_seq_len * hidden_size)
+    q_new_stride_1,     # Stride for the second dimension of q_new (usually hidden_size)
+    select_qp_stride_0,  # Stride for the first dimension of select_qp (usually max_seq_len)
+    BLOCK_SIZE_SEQ: tl.constexpr = 512,  # Block size for sequence length
+    BLOCK_SIZE_HIDDEN: tl.constexpr = 1024,  # Block size for hidden dimension
+):
+    #BLOCK_SIZE_SEQ: tl.constexpr = 512
+    #BLOCK_SIZE_HIDDEN: tl.constexpr = 1024
+
+    # Batch index (each block processes one batch)
+    batch_id = tl.program_id(0)
+    seq_block_id = tl.program_id(1)
+    hidden_size = q_stride_0
+
+    # Load the start and end indices for the current batch
+    seq_start = tl.load(cu_seq_len_q_ptr + batch_id)
+    seq_end = tl.load(cu_seq_len_q_ptr + batch_id + 1)
+    batch_seq_len = seq_end - seq_start  # Length of the current batch
+
+    # Sequence indices for the current block
+    seq_offset = tl.arange(0, BLOCK_SIZE_SEQ) + seq_block_id * BLOCK_SIZE_SEQ
+    seq_indices = seq_start + seq_offset  # Absolute indices in q
+    seq_mask = seq_offset < batch_seq_len  # Mask for valid sequences
+
+    tl.store(
+        select_qp_ptr + batch_id * select_qp_stride_0 + seq_offset,
+        tl.full(seq_mask.shape, 1, dtype=tl.int8),
+        mask=seq_mask,
+    )
+    # print(batch_id, seq_start, seq_end)
+    # print(seq_mask)
+
+    # Iterate over hidden dimension blocks
+    for hidden_block_start in range(0, hidden_size, BLOCK_SIZE_HIDDEN):
+        # Hidden dimension indices for the current block
+        hidden_offset = tl.arange(0, BLOCK_SIZE_HIDDEN) + hidden_block_start
+        hidden_mask = hidden_offset < hidden_size  # Mask for valid hidden positions
+
+        # Check if the current block has valid indices in either dimension
+        if tl.sum(seq_mask) > 0 and tl.sum(hidden_mask) > 0:  
+            data = tl.load(
+                q_ptr + seq_indices[:, None] * q_stride_0 + hidden_offset[None, :],
+                mask=seq_mask[:, None] & hidden_mask[None, :],
+                other=0.0  # Fill invalid positions with 0
+            )
+            tl.store(
+                q_new_ptr + batch_id * q_new_stride_0 + seq_offset[:, None] * q_new_stride_1 + hidden_offset[None, :],
+                data,
+                mask=seq_mask[:, None] & hidden_mask[None, :]
+            )
+    # print(f'finish {batch_id}, {seq_block_id}')
+
+
+@triton.jit
+def reorder_kv_kernel(
+    key_buffer_ptr,      # Pointer to key buffer [buffer_size, head_num, head_dim]
+    value_buffer_ptr,    # Pointer to value buffer [buffer_size, head_num, head_dim]
+    kv_indices_ptr,      # Pointer to kv_indices [sum_seq]
+    cu_seq_len_cache_ptr,  # Pointer to cumulative sequence lengths [batch_size + 1]
+    key_new_ptr,         # Pointer to the new key tensor [batch_size, max_seq_len, head_num, head_dim]
+    value_new_ptr,       # Pointer to the new value tensor [batch_size, max_seq_len, head_num, head_dim]
+    head_dim,            # Dimension of each head
+    kv_buffer_stride_0,     # Stride for the first dimension of key_buffer (head_num * head_dim)
+    kv_buffer_stride_1,     # Stride for the second dimension of key_buffer (head_dim)
+    kv_new_stride_0,    # Stride for the first dimension of key_new (max_seq_len * head_num * head_dim)
+    kv_new_stride_1,    # Stride for the second dimension of key_new (head_num * head_dim)
+    kv_new_stride_2,    # Stride for the third dimension of key_new (head_dim)
+    BLOCK_SIZE_SEQ: tl.constexpr = 512,  # Block size for sequence length
+    BLOCK_SIZE_HEAD_DIM: tl.constexpr = 128,  # Block size for head_dim
+):
+    # Batch ID (each block processes one batch)
+    batch_id = tl.program_id(0)
+    seq_block_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+
+    # Load the start and end indices for the current batch
+    seq_start = tl.load(cu_seq_len_cache_ptr + batch_id)  # Start index in kv_indices
+    seq_end = tl.load(cu_seq_len_cache_ptr + batch_id + 1)  # End index in kv_indices
+    batch_seq_len = seq_end - seq_start  # Length of the current batch
+
+    # Sequence indices for the current block
+    seq_offset = tl.arange(0, BLOCK_SIZE_SEQ) + seq_block_id * BLOCK_SIZE_SEQ  # Sequence block offsets
+    kv_indices_offset = seq_start + seq_offset  # Offset into kv_indices
+    seq_mask = seq_offset < batch_seq_len  # Mask to ensure valid sequence indices
+
+    # Process head_dim in blocks
+    for head_block_start in range(0, head_dim, BLOCK_SIZE_HEAD_DIM):
+        # Head dimension indices for the current block
+        head_dim_offset = tl.arange(0, BLOCK_SIZE_HEAD_DIM) + head_block_start
+        head_dim_mask = head_dim_offset < head_dim  # Mask for valid head_dim range
+
+        # If valid indices exist
+        if tl.sum(seq_mask, axis=0) > 0 and tl.sum(head_dim_mask, axis=0) > 0:
+            # Gather indices for the current batch
+            kv_indices = tl.load(
+                kv_indices_ptr + kv_indices_offset,
+                mask=seq_mask,
+                other=0  # Fallback for invalid indices
+            )
+
+            # Load Key from buffer
+            key_data = tl.load(
+                key_buffer_ptr + kv_indices[:, None] * kv_buffer_stride_0
+                               + head_id * kv_buffer_stride_1
+                               + head_dim_offset[None, :],
+                mask=seq_mask[:, None] & head_dim_mask[None, :],
+                other=0.0
+            )
+
+            # Load Value from buffer
+            value_data = tl.load(
+                value_buffer_ptr + kv_indices[:, None] * kv_buffer_stride_0
+                                 + head_id * kv_buffer_stride_1
+                                 + head_dim_offset[None, :],
+                mask=seq_mask[:, None] & head_dim_mask[None, :],
+                other=0.0
+            )
+
+            # Store Key in new tensor
+            tl.store(
+                key_new_ptr + batch_id * kv_new_stride_0
+                             + seq_offset[:, None] * kv_new_stride_1
+                             + head_id * kv_new_stride_2
+                             + head_dim_offset[None, :],
+                key_data,
+                mask=seq_mask[:, None] & head_dim_mask[None, :]
+            )
+
+            # Store Value in new tensor
+            tl.store(
+                value_new_ptr + batch_id * kv_new_stride_0
+                               + seq_offset[:, None] * kv_new_stride_1
+                               + head_id * kv_new_stride_2
+                               + head_dim_offset[None, :],
+                value_data,
+                mask=seq_mask[:, None] & head_dim_mask[None, :]
+            )
 
 
 @triton.jit
