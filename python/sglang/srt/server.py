@@ -59,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.new_scheduler import run_adaptive_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer, time_func_latency
 from sglang.srt.openai_api.adapter import (
@@ -451,8 +452,12 @@ def launch_engine(
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            # proc = mp.Process(
+            #     target=run_scheduler_process,
+            #     args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+            # )
             proc = mp.Process(
-                target=run_scheduler_process,
+                target=run_adaptive_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
             )
             proc.start()

@@ -703,7 +703,7 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
-            assert seq_len - pre_len == req.extend_input_len
+            assert seq_len - pre_len == req.extend_input_len, f"{req.rid}: {seq_len} - {pre_len} != {req.extend_input_len}"
 
             if pre_len > 0:
                 self.req_to_token_pool.write(
