@@ -161,6 +161,10 @@ class OpenAI(BaseBackend):
                 prompt = s.text_
 
             kwargs = sampling_params.to_openai_kwargs()
+            if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
+                kwargs.pop("max_tokens", None)
+            else:
+                kwargs.pop("max_completion_tokens", None)
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -175,6 +179,7 @@ class OpenAI(BaseBackend):
             ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
+
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -366,6 +371,11 @@ class OpenAI(BaseBackend):
 def openai_completion(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
 ):
+    # if "ebnf" is in kwargs, warn and remove
+    if "ebnf" in kwargs:
+        warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
+        del kwargs["ebnf"]
+
     for attempt in range(retries):
         try:
             if is_chat:
@@ -398,6 +408,11 @@ def openai_completion(
 def openai_completion_stream(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
 ):
+    # if "ebnf" is in kwargs, warn and remove
+    if "ebnf" in kwargs:
+        warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
+        del kwargs["ebnf"]
+
     for attempt in range(retries):
         try:
             if is_chat:

@@ -63,6 +63,7 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -227,6 +228,7 @@ class SglFunction:
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
+        generator_style: bool = False,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -277,6 +279,7 @@ class SglFunction:
             default_sampling_para,
             num_threads,
             progress_bar,
+            generator_style=generator_style,
         )
 
     def trace(self, *, backend=None, **kwargs):
