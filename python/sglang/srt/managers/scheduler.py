@@ -550,6 +550,9 @@ class Scheduler:
             )
             req.tokenizer = self.tokenizer
 
+            # add a recv time
+            req.recv_time = time.time()
+
             if recv_req.session_id is not None:
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_id} does not exist"

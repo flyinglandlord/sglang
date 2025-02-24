@@ -69,6 +69,8 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
 
+    enable_custom_scheduler: bool = False
+
     # Other runtime options
     tp_size: int = 1
     stream_interval: int = 1
@@ -428,6 +430,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
+        )
+
+        parser.add_argument(
+            "--enable-custom-scheduler",
+            action="store_true",
+            default=ServerArgs.enable_custom_scheduler,
+            help="Enable custom scheduler.",
         )
 
         # Other runtime options

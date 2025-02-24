@@ -452,14 +452,16 @@ def launch_engine(
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
-            # proc = mp.Process(
-            #     target=run_scheduler_process,
-            #     args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            # )
-            proc = mp.Process(
-                target=run_adaptive_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
+            if server_args.enable_custom_scheduler:
+                proc = mp.Process(
+                    target=run_adaptive_scheduler_process,
+                    args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                )
+            else:
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                )
             proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)

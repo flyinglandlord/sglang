@@ -303,6 +303,9 @@ class Req:
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
 
+        # The recv time of the request
+        self.recv_time = None
+
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
             self.image_inputs = image_inputs

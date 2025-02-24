@@ -14,6 +14,7 @@ import setproctitle
 import torch
 import zmq
 
+from python.sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS_ESTIMATION, AddReqResult, PrefillAdder
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -32,6 +33,9 @@ class AdaptiveScheduler(Scheduler):
         self.virtual_buffer_size = {}
         self.decode_time_stamp = {}
         self.output_speed = 20
+        self.avg_decode_time = 0.0
+        self.avg_prefill_time = 0.0
+        self.schedule_interval = 1.0
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -75,7 +79,30 @@ class AdaptiveScheduler(Scheduler):
                     print(f"{ed - st} {time_stamp}", file=open('tmp/batch_detail.txt', 'a'))
                     print(f"{ed - st}", file=open('tmp/batch_info.txt', 'a'))
                 else:
+                    torch.cuda.synchronize()
+                    st = time.time()
+
                     result = self.run_batch(batch)
+
+                    torch.cuda.synchronize()
+                    ed = time.time()
+
+                    if batch.forward_mode.is_decode():
+                        if self.avg_decode_time == 0.0:
+                            self.avg_decode_time = (ed - st)
+                        else:
+                            self.avg_decode_time = (self.avg_decode_time + (ed - st)) / 2
+                    elif batch.forward_mode.is_extend():
+                        if self.avg_prefill_time == 0.0:
+                            self.avg_prefill_time = (ed - st)
+                        else:
+                            self.avg_prefill_time = (self.avg_prefill_time + (ed - st)) / 2
+                
+                for req in batch.reqs:
+                    if req.rid not in self.decode_time_stamp:
+                        self.decode_time_stamp[req.rid] = [time.time()]
+                    else:
+                        self.decode_time_stamp[req.rid].append(time.time())
 
                 self.process_batch_result(batch, result)
             else:
@@ -141,9 +168,8 @@ class AdaptiveScheduler(Scheduler):
             if not self.last_batch.is_empty():
                 # update the virtual buffer size
                 # primarily the virtual buffer size is 0, because there is no output token
-                for req in self.last_batch.reqs:
-                    self.virtual_buffer_size[req.rid] = 10
-                    self.decode_time_stamp[req.rid] = time.time()
+                # for req in self.last_batch.reqs:
+                #     self.virtual_buffer_size[req.rid] = 10
 
                 # merge the last batch into the running batch
                 if self.running_batch is None:
@@ -154,53 +180,183 @@ class AdaptiveScheduler(Scheduler):
         # Next we get the preference decode requests by their virtual buffer size
         # sort the decode request by the current virtual buffer size
         # current virtual buffer size = virtual buffer size - output speed * (current time - decode time stamp)
-        if self.running_batch is not None:
+        if self.batch_is_full:
             # print(self.virtual_buffer_size)
             current_time = time.time()
-            decode_reqs = []
-            for req in self.running_batch.reqs:
-                self.virtual_buffer_size[req.rid] -= self.output_speed * (current_time - self.decode_time_stamp[req.rid])
-                decode_reqs.append((req, self.virtual_buffer_size[req.rid]))
-            decode_reqs.sort(key=lambda x: x[1], reverse=True)
+            Q_wait = {}
+            Q_service = {}
+            for req in (self.running_batch.reqs + self.waiting_queue):
+                current_output_len = len(req.output_ids)
+                req_history_time = self.decode_time_stamp[req.rid]
+                T_actual = req_history_time[0]
+                T_ideal = req.recv_time + self.avg_prefill_time
+                Q_history = max(0, T_actual[0] - T_ideal[0])
+                # Calculate Q_history
+                for i in range(1, current_output_len):
+                    # T_actual
+                    if T_actual >= req_history_time[i]:
+                        T_actual = T_actual + 1 / self.output_speed
+                    else:
+                        T_actual = req_history_time[i]
+                    # T_ideal
+                    T_ideal = T_ideal + 1 / self.output_speed
+                    # Q_history
+                    Q_history += max(0, T_actual - T_ideal)
+                
+                # suppose we re-scheudle the request at the current time
+                # next time we will schedule the request at the current time + 50 * self.avg_decode_time
+                # Calculate Q_wait
+                Q_service[req.rid] = Q_history
+                Q_wait[req.rid] = Q_history
+                wait_T_actual =  T_actual + self.schedule_interval
+                service_T_actual = T_actual
+                for i in range(self.schedule_interval // self.avg_decode_time):
+                    Q_service[req.rid] += max(0, service_T_actual - T_ideal)
+                    Q_wait[req.rid] += max(0, wait_T_actual - T_ideal)
+                    wait_T_actual += 1 / self.output_speed
+                    service_T_actual += 1 / self.output_speed
 
-            # filter out the evict_reqs from the decode_reqs, which satisfies the condition buffer_size >= 100
-            seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
-            keep_indices = [i for i in range(len(self.running_batch.reqs))]
-            evict_reqs = []
-            for idx, _ in enumerate(self.running_batch.reqs):
-                req = self.running_batch.reqs[idx]
-                if self.virtual_buffer_size[req.rid] < 100:
-                    continue
-                if isinstance(self.tree_cache, ChunkCache):
-                    # ChunkCache does not have eviction
-                    
-                    token_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : seq_lens_cpu[idx]
-                    ]
-                    self.token_to_kv_pool.free(token_indices)
-                    self.req_to_token_pool.free(req.req_pool_idx)
-                    del self.tree_cache.entries[req.rid]
+            # sort the request by the Q_wait - Q_service
+            priority = [(req, Q_wait[req.rid] - Q_service[req.rid]) for req in self.waiting_queue]
+            priority.sort(key=lambda x: x[1], reverse=True)
+
+            # split the request by inner running_batch and outer running_batch
+            running_priority = []
+            waiting_priority = []
+            for req, _ in priority:
+                if req in self.running_batch.reqs:
+                    running_priority.append(req)
                 else:
-                    assert False, "Only ChunkCache supports new scheduler"
+                    waiting_priority.append(req)
 
-                req.prefix_indices = []
-                req.last_node = None
-                req.extend_input_len = 0
-                req.is_retracted = True
+            # check the request in the running_batch need to be swapped out
+            # self.new_token_ratio
+            # self.token_to_kv_pool.size
+            # self.max_prefill_tokens
+            max_tokens = self.token_to_kv_pool.size
+            max_prefill_tokens = self.max_prefill_tokens
+            new_token_ratio = self.new_token_ratio
+            selected = []
+            for req, pri in priority:
+                if req in self.running_batch.reqs:
+                    remain_tokens = max_tokens - self.running_batch.seq_lens[req.rid] - min(
+                                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                                CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                            ) * new_token_ratio
+                    if remain_tokens >= 0:
+                        max_tokens = remain_tokens
+                        selected.append(req)
+                    else:
+                        continue
+                else:
+                    extend_len = len(req.fill_ids)
+                    remain_tokens = max_tokens - extend_len - min(
+                                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                                CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                            ) * new_token_ratio
+                    if remain_tokens >= 0 and max_prefill_tokens - extend_len >= 0:
+                        max_tokens = remain_tokens
+                        max_prefill_tokens -= extend_len
+                        selected.append(req)
+                    else:
+                        continue
 
-                # For incremental logprobs
-                req.last_update_decode_tokens = 0
-                req.logprob_start_len = 10**9
-                keep_indices.remove(idx)
-                evict_reqs.append(req)
+            # clear the request not in the selected list
+            seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
+            for req in self.running_batch.reqs:
+                if req not in selected:
+                    if isinstance(self.tree_cache, ChunkCache):
+                        # ChunkCache directly evict all tokens
+                        token_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, : seq_lens_cpu[req.rid]
+                        ]
+                        self.token_to_kv_pool.free(token_indices)
+                        self.req_to_token_pool.free(req.req_pool_idx)
+                        del self.tree_cache.entries[req.rid]
+                    else:
+                        assert False, "Only ChunkCache supports new scheduler"
+                    
+                    req.prefix_indices = []
+                    req.last_node = None
+                    req.extend_input_len = 0
+                    req.is_retracted = True
 
-            # remove the evict_reqs from the running batch
-            if len(evict_reqs) > 0:
-                print(keep_indices)
-                for i in evict_reqs:
-                    print(i.prefix_indices)
-                self.running_batch.filter_batch(keep_indices=keep_indices)
-                self.waiting_queue.extend(evict_reqs)
+                    # For incremental logprobs
+                    req.last_update_decode_tokens = 0
+                    req.logprob_start_len = 10**9
+
+                    self.waiting_queue.append(req)
+            
+            # merge a new prefill batch in the running batch
+            can_run_list = [r for r in waiting_priority if r in selected and r not in self.running_batch.reqs]
+            new_batch = ScheduleBatch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+            )
+            new_batch.prepare_for_extend()
+            if (
+                self.is_mixed_chunk
+                and self.running_batch is not None
+                and not (new_batch.return_logprob or self.running_batch.return_logprob)
+            ):
+                self.running_batch.filter_batch()
+                if not self.running_batch.is_empty():
+                    self.running_batch.prepare_for_decode()
+                    new_batch.mix_with_running(self.running_batch)
+                    new_batch.decoding_reqs = self.running_batch.reqs
+                self.running_batch = None
+            else:
+                new_batch.decoding_reqs = None
+            return new_batch
+        
+            # decode_reqs = []
+            # for req in self.running_batch.reqs:
+            #     self.virtual_buffer_size[req.rid] -= self.output_speed * (current_time - self.decode_time_stamp[req.rid])
+            #     decode_reqs.append((req, self.virtual_buffer_size[req.rid]))
+            # decode_reqs.sort(key=lambda x: x[1], reverse=True)
+
+            # # filter out the evict_reqs from the decode_reqs, which satisfies the condition buffer_size >= 100
+            # seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
+            # keep_indices = [i for i in range(len(self.running_batch.reqs))]
+            # evict_reqs = []
+            # for idx, _ in enumerate(self.running_batch.reqs):
+            #     req = self.running_batch.reqs[idx]
+            #     if self.virtual_buffer_size[req.rid] < 100:
+            #         continue
+            #     if isinstance(self.tree_cache, ChunkCache):
+            #         # ChunkCache does not have eviction
+                    
+            #         token_indices = self.req_to_token_pool.req_to_token[
+            #             req.req_pool_idx, : seq_lens_cpu[idx]
+            #         ]
+            #         self.token_to_kv_pool.free(token_indices)
+            #         self.req_to_token_pool.free(req.req_pool_idx)
+            #         del self.tree_cache.entries[req.rid]
+            #     else:
+            #         assert False, "Only ChunkCache supports new scheduler"
+
+            #     req.prefix_indices = []
+            #     req.last_node = None
+            #     req.extend_input_len = 0
+            #     req.is_retracted = True
+
+            #     # For incremental logprobs
+            #     req.last_update_decode_tokens = 0
+            #     req.logprob_start_len = 10**9
+            #     keep_indices.remove(idx)
+            #     evict_reqs.append(req)
+
+            # # remove the evict_reqs from the running batch
+            # if len(evict_reqs) > 0:
+            #     print(keep_indices)
+            #     for i in evict_reqs:
+            #         print(i.prefix_indices)
+            #     self.running_batch.filter_batch(keep_indices=keep_indices)
+            #     self.waiting_queue.extend(evict_reqs)
 
         # if the cumulated decode requests are enough, and all these decode requests have empty or small buffer size
         # we need to run the decode requests
@@ -221,7 +377,119 @@ class AdaptiveScheduler(Scheduler):
 
 
     def get_new_batch_prefill(self):
-        return super().get_new_batch_prefill()
+        # Check if the grammar is ready in the grammar queue
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
+        # Handle the cases where prefill is not allowed
+        if (
+            self.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.being_chunked_req is None:
+            return None
+
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        if running_bs >= self.max_running_requests:
+            self.batch_is_full = True
+            return None
+
+        # Get priority queue
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.running_batch,
+            self.new_token_ratio,
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+        )
+
+        has_being_chunked = self.being_chunked_req is not None
+        if has_being_chunked:
+            self.being_chunked_req.init_next_round_input()
+            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
+
+        if self.lora_paths:
+            lora_set = (
+                set([req.lora_path for req in self.running_batch.reqs])
+                if self.running_batch is not None
+                else set([])
+            )
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+            if (
+                self.lora_paths
+                and len(
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
+                > self.max_loras_per_batch
+            ):
+                self.batch_is_full = True
+                break
+
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                self.batch_is_full = True
+                break
+
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            res = adder.add_one_req(req)
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    self.batch_is_full = True
+                break
+
+        # Update waiting queue
+        can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        if adder.new_being_chunked_req is not None:
+            assert self.being_chunked_req is None
+            self.being_chunked_req = adder.new_being_chunked_req
+
+        if self.being_chunked_req:
+            self.being_chunked_req.is_being_chunked += 1
+
+        # Print stats
+        if self.tp_rank == 0:
+            self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+        )
+        new_batch.prepare_for_extend()
+
+        # Mixed-style chunked prefill
+        if (
+            self.is_mixed_chunk
+            and self.running_batch is not None
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+            self.running_batch = None
+        else:
+            new_batch.decoding_reqs = None
+
+        return new_batch
     
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         # update the virtual buffer size
