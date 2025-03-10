@@ -131,6 +131,8 @@ class Scheduler:
         tp_rank: int,
         dp_rank: Optional[int],
     ):
+        self.decode_time_stamp = None
+        
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -296,7 +298,7 @@ class Scheduler:
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            print('chunk cache here')
+            # print('chunk cache here')
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
@@ -494,6 +496,11 @@ class Scheduler:
                     for req in batch.decoding_reqs:
                         print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
                 print('', file=open('tmp/batch_detail.txt', 'a'))
+                # 2025.03.10: add the waiting queue information
+                if self.waiting_queue is not None:
+                    for req in self.waiting_queue:
+                        print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                print('', file=open('tmp/batch_detail.txt', 'a'))
                 if batch.forward_mode.is_mixed():
                     print(f"mixed: {len(batch.decoding_reqs)} {len(batch.reqs) - len(batch.decoding_reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ', file=open('tmp/batch_info.txt', 'a'))
                 elif batch.forward_mode.is_extend():
@@ -664,6 +671,8 @@ class Scheduler:
 
             # add a recv time
             req.recv_time = time.time()
+            if self.decode_time_stamp is not None:
+                self.decode_time_stamp[req.rid] = []
 
             if (
                 recv_req.session_params is not None
@@ -1129,6 +1138,9 @@ class Scheduler:
 
         # Update batch tensors
         batch.prepare_for_decode()
+
+        # if self.attn_tp_rank == 0:
+        #    self.log_decode_stats()
         return batch
 
     def run_batch(

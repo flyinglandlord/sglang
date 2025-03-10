@@ -48,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.new_scheduler import run_adaptive_scheduler_process
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.orchestration.std.orchestrator import StdOrchestrator
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -381,10 +382,16 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
-            )
+            if server_args.enable_custom_scheduler:
+                proc = mp.Process(
+                    target=run_adaptive_scheduler_process,
+                    args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                )
+            else:
+                proc = mp.Process(
+                    target=run_scheduler_process,
+                    args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
             scheduler_procs.append(proc)

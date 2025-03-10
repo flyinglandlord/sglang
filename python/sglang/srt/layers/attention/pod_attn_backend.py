@@ -1,29 +1,36 @@
 from __future__ import annotations
 
+from python.sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
+
+"""
+Support different attention backends.
+Now there are two backends: FlashInfer and Triton.
+FlashInfer is faster and Triton is easier to customize.
+Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
+"""
+
+import math
+import os
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from functools import partial
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
-from torch.nn.functional import scaled_dot_product_attention
 
-from pod_attn import true_fused_attn_with_kvcache
-from typing import TYPE_CHECKING, List
-
-from sglang.srt.layers.attention import AttentionBackend
 from sglang.global_config import global_config
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_flashinfer_available,
-    should_use_tensor_core,
-)
+from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -32,6 +39,7 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 
 class WrapperDispatch(Enum):

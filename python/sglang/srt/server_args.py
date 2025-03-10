@@ -70,9 +70,8 @@ class ServerArgs:
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-
-    enable_custom_scheduler: bool = False
     prefill_only_one_req: bool = False
+    enable_custom_scheduler: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -495,18 +494,17 @@ class ServerArgs:
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
         )
-
-        parser.add_argument(
-            "--enable-custom-scheduler",
-            action="store_true",
-            default=ServerArgs.enable_custom_scheduler,
-            help="Enable custom scheduler.",
-        )
         parser.add_argument(
             "--prefill-only-one-req",
             type=bool,
             help="If true, we only prefill one request at one prefill batch",
             default=ServerArgs.prefill_only_one_req,
+        )
+        parser.add_argument(
+            "--enable-custom-scheduler",
+            action="store_true",
+            default=ServerArgs.enable_custom_scheduler,
+            help="Enable custom scheduler for the requests.",
         )
 
         # Other runtime options
@@ -663,6 +661,88 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
+        # LoRA
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=LoRAPathAction,
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--lora-backend",
+            type=str,
+            default="triton",
+            help="Choose the kernel backend for multi-LoRA serving.",
+        )
+
+        # Kernel backend
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            choices=["flashinfer", "triton", "torch_native"],
+            default=ServerArgs.attention_backend,
+            help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=["flashinfer", "pytorch"],
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mla",
+            action="store_true",
+            help="Enable FlashInfer MLA optimization",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE", "NEXTN"],
+            help="Speculative algorithm.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            choices=[1, 2, 4, 8],
+            default=ServerArgs.speculative_eagle_topk,
+        )
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -698,45 +778,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
-        )
-
-        # LoRA
-        parser.add_argument(
-            "--lora-paths",
-            type=str,
-            nargs="*",
-            default=None,
-            action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
-        )
-        parser.add_argument(
-            "--max-loras-per-batch",
-            type=int,
-            default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
-        )
-
-        # Kernel backend
-        parser.add_argument(
-            "--attention-backend",
-            type=str,
-            choices=["flashinfer", "triton", "torch_native", "pod"],
-            default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
-        )
-        parser.add_argument(
-            "--sampling-backend",
-            type=str,
-            choices=["flashinfer", "pytorch"],
-            default=ServerArgs.sampling_backend,
-            help="Choose the kernels for sampling layers.",
-        )
-        parser.add_argument(
-            "--grammar-backend",
-            type=str,
-            choices=["xgrammar", "outlines"],
-            default=ServerArgs.grammar_backend,
-            help="Choose the backend for grammar-guided decoding.",
         )
 
         # Optimization/debug options
