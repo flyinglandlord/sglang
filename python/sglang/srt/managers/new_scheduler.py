@@ -205,7 +205,7 @@ class AdaptiveScheduler(Scheduler):
     #     wait_T_actual += 1 / self.output_speed
     #     service_T_actual += 1 / self.output_speed
 
-    def get_request_QoE(self, req, B):
+    def predict_request_QoE(self, req, B, no_pred=False):
         # We have the recv_time(req.recv_time) and the output_speed(self.output_speed)
         # from self.decode_time_stamp get the list of decode output time
         # QoE = 1 - \sum_i (T_actual_i - T_ideal_i) / \sum_i (T_actual_n - T_ideal_i)
@@ -223,13 +223,13 @@ class AdaptiveScheduler(Scheduler):
             T_actual = [T_output[0]]
 
             # try to extend the T_actual, T_output and T_ideal in the schedule_interval
-            if B != -1:
+            if B != -1 and not no_pred:
                 pred_decode_time = self.predict_decode_time(B)
                 pred_decode_token = int(self.reschedule_interval / pred_decode_time)
 
                 T_ideal = T_ideal + [T_ideal[-1] + i / output_speed for i in range(1, pred_decode_token)]
                 T_output = T_output + [T_output[-1] + i * pred_decode_time for i in range(1, pred_decode_token)]
-            else:
+            elif not no_pred:
                 T_ideal = T_ideal + [T_ideal[-1] + 1 / output_speed]
                 T_output = T_output + [T_output[-1] + self.reschedule_interval + self.predict_decode_time(1)]
             
@@ -242,6 +242,7 @@ class AdaptiveScheduler(Scheduler):
             Q = 1 - sum([(T_actual[i] - T_ideal[i]) for i in range(len(T_output))]) \
                 / sum([(T_actual[-1] - T_ideal[i]) for i in range(len(T_output))])
         else:
+            assert no_pred == False, "The request has no output but we need to calculate the QoE"
             if B == -1:
                 Q = 0
             else:
@@ -254,12 +255,12 @@ class AdaptiveScheduler(Scheduler):
         Q_wait = {}
         Q_service = {}
         for req in self.running_batch.reqs:
-            Q_service[req.rid] = self.get_request_QoE(req, B)
-            Q_wait[req.rid] = self.get_request_QoE(req, -1)
+            Q_service[req.rid] = self.predict_request_QoE(req, B)
+            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
             schedulable.append(req)
         for req in self.waiting_queue:
-            Q_service[req.rid] = self.get_request_QoE(req, B)
-            Q_wait[req.rid] = self.get_request_QoE(req, -1)
+            Q_service[req.rid] = self.predict_request_QoE(req, B)
+            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
             schedulable.append(req)
 
         # sort the request by the (Q_wait - Q_service) / request_length
@@ -635,6 +636,9 @@ class AdaptiveScheduler(Scheduler):
 
         return new_batch
     
+    def calc_qoe(self, req):
+        return self.predict_request_QoE(req, -1, no_pred=True)
+    
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         # update the virtual buffer size & decode time stamp
         #for req in batch.reqs:
@@ -644,6 +648,11 @@ class AdaptiveScheduler(Scheduler):
                 self.decode_time_stamp[req.rid] = [time.time()]
             else:
                 self.decode_time_stamp[req.rid].append(time.time())
+            
+            req.check_finished()
+            if req.finished():
+                service_qoe = self.calc_qoe(req)
+                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
         
         # do other things
         super().process_batch_result_decode(batch, result)
@@ -654,6 +663,11 @@ class AdaptiveScheduler(Scheduler):
                 self.decode_time_stamp[req.rid] = [time.time()]
             else:
                 self.decode_time_stamp[req.rid].append(time.time())
+
+            req.check_finished()
+            if req.finished():
+                service_qoe = self.calc_qoe(req)
+                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
         return super().process_batch_result_prefill(batch, result)
 
 
