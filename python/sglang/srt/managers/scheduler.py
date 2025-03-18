@@ -32,6 +32,7 @@ import setproctitle
 import torch
 import zmq
 
+from python.sglang.srt.mem_cache.hichunk_cache import HiChunkCache
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend

@@ -16,6 +16,13 @@ class ChunkCacheEntry:
         self.rid = rid
         self.value = value
 
+        # indicate whether the cache entry is evicted
+        self.evicted = False
+        # indicate whether the cache entry is backup to the host memory
+        self.backuped = False
+        self.host_value = None
+        self.host_req_pool_idx = None
+
 
 class ChunkCache(BasePrefixCache):
     def __init__(

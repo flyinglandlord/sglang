@@ -27,16 +27,16 @@ from sglang.global_config import global_config
 
 logger = logging.getLogger(__name__)
 
-class AdaptiveScheduler(Scheduler):
+class AndesScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.log_batch_status = True
         self.virtual_buffer_size = {}
         self.decode_time_stamp = {}
-        self.output_speed = 40
+        self.output_speed = 25
         self.avg_decode_time = 0.01
         self.avg_prefill_time = 0.1
-        self.reschedule_interval = 1.0
+        self.reschedule_interval = 0.1
         self.last_reschedule_time = None
     
     def predict_prefill_time(self, x, y, z):
@@ -223,15 +223,14 @@ class AdaptiveScheduler(Scheduler):
             T_actual = [T_output[0]]
 
             # try to extend the T_actual, T_output and T_ideal in the schedule_interval
+            pred_decode_time = self.predict_decode_time(B)
+            pred_decode_token = int(self.reschedule_interval / pred_decode_time)
             if B != -1 and not no_pred:
-                pred_decode_time = self.predict_decode_time(B)
-                pred_decode_token = int(self.reschedule_interval / pred_decode_time)
-
-                T_ideal = T_ideal + [T_ideal[-1] + i / output_speed for i in range(1, pred_decode_token)]
-                T_output = T_output + [T_output[-1] + i * pred_decode_time for i in range(1, pred_decode_token)]
+                T_ideal = T_ideal + [(T_ideal[-1] + i / output_speed) for i in range(1, pred_decode_token)]
+                T_output = T_output + [(T_output[-1] + i * pred_decode_time) for i in range(1, pred_decode_token)]
             elif not no_pred:
-                T_ideal = T_ideal + [T_ideal[-1] + 1 / output_speed]
-                T_output = T_output + [T_output[-1] + self.reschedule_interval + self.predict_decode_time(1)]
+                T_ideal = T_ideal + [(T_ideal[-1] + i / output_speed) for i in range(1, pred_decode_token)]
+                T_output = T_output + [(T_output[-1] + self.reschedule_interval + i * self.predict_decode_time(1)) for i in range(1, pred_decode_token)]
             
             for i in range(1, len(T_output)):
                 if T_actual[-1] + 1 / output_speed >= T_output[i]:
@@ -246,7 +245,7 @@ class AdaptiveScheduler(Scheduler):
             if B == -1:
                 Q = 0
             else:
-                Q = 1
+                Q = current_time - recv_time
 
         return Q
     
@@ -255,16 +254,18 @@ class AdaptiveScheduler(Scheduler):
         Q_wait = {}
         Q_service = {}
         for req in self.running_batch.reqs:
-            Q_service[req.rid] = self.predict_request_QoE(req, B)
-            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
-            schedulable.append(req)
+            if not req.finished():
+                Q_service[req.rid] = self.predict_request_QoE(req, B)
+                Q_wait[req.rid] = self.predict_request_QoE(req, -1)
+                schedulable.append(req)
         for req in self.waiting_queue:
-            Q_service[req.rid] = self.predict_request_QoE(req, B)
-            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
-            schedulable.append(req)
+            if not req.finished():
+                Q_service[req.rid] = self.predict_request_QoE(req, B)
+                Q_wait[req.rid] = self.predict_request_QoE(req, -1)
+                schedulable.append(req)
 
         # sort the request by the (Q_wait - Q_service) / request_length
-        priority = [(req, (Q_wait[req.rid] - Q_service[req.rid]) / (len(req.output_ids) + len(req.origin_input_ids)))  \
+        priority = [(req, (Q_service[req.rid] - Q_wait[req.rid]) / (len(req.output_ids) + len(req.origin_input_ids)))  \
                     for req in schedulable]
         priority.sort(key=lambda x: x[1], reverse=True)
 
@@ -329,7 +330,7 @@ class AdaptiveScheduler(Scheduler):
 
         
     def reschedule_requests(self):
-        print('======Reschedule the requests======')
+        # print('======Reschedule the requests======')
         # Try different batch size
         max_qoe_gain = -100000
         max_selected = None
@@ -361,7 +362,7 @@ class AdaptiveScheduler(Scheduler):
         else:
             Bmax = len(self.running_batch.reqs)
 
-        logger.info(f"Predicted Bmin: {Bmin}, Bmax: {Bmax}")
+        # logger.info(f"Predicted Bmin: {Bmin}, Bmax: {Bmax}")
 
         for B in range(min(Bmin-3, Bmax), Bmax+1):
             selected, qoe_gain, total_tokens, new_tokens = self.reschedule_requests_with_batch_size(B)
@@ -372,7 +373,7 @@ class AdaptiveScheduler(Scheduler):
                 max_batch_size = len(selected)
                 max_total_tokens = total_tokens
                 max_new_tokens = new_tokens
-        logger.info(f"Max QoE gain: {max_qoe_gain}, batch size: {max_batch_size}")
+        # logger.info(f"Max QoE gain: {max_qoe_gain}, batch size: {max_batch_size}")
         self.last_reschedule_time = time.time()
 
         can_run_list = []
@@ -405,12 +406,16 @@ class AdaptiveScheduler(Scheduler):
                 req.reset_for_retract()
 
                 swap_out.append(req)
-        self.running_batch.filter_batch(keep_indices=[i for i in range(len(self.running_batch.reqs)) if self.running_batch.reqs[i] in selected])
+        keep_indices = []
+        for i in range(len(self.running_batch.reqs)):
+            if self.running_batch.reqs[i] in max_selected:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
         self.waiting_queue.extend(swap_out)
 
         # Log the new_batch information
-        logger.info("Re-schedule batch. #rescheduled-seq: %d. running-seq: %d. total-tokens: %d. new-tokens: %d" % 
-                    (len(can_run_list), len(self.running_batch.reqs), max_total_tokens, max_new_tokens))
+        # logger.info("Re-schedule batch. #rescheduled-seq: %d. running-seq: %d. total-tokens: %d. new-tokens: %d" % 
+        #             (len(can_run_list), len(self.running_batch.reqs), max_total_tokens, max_new_tokens))
         
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -424,7 +429,7 @@ class AdaptiveScheduler(Scheduler):
             self.server_args.return_hidden_states,
         )
         new_batch.prepare_for_extend()
-
+        self.batch_is_full = True
         # Mixed-style chunked prefill
         # if (
         #     self.is_mixed_chunk
@@ -648,14 +653,84 @@ class AdaptiveScheduler(Scheduler):
                 self.decode_time_stamp[req.rid] = [time.time()]
             else:
                 self.decode_time_stamp[req.rid].append(time.time())
-            
-            req.check_finished()
-            if req.finished():
-                service_qoe = self.calc_qoe(req)
-                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
         
-        # do other things
-        super().process_batch_result_decode(batch, result)
+        # Copy from the original process_batch_result_decode
+        logits_output, next_token_ids, bid = (
+            result.logits_output,
+            result.next_token_ids,
+            result.bid,
+        )
+        self.num_generated_tokens += len(batch.reqs)
+
+        if self.enable_overlap:
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            next_token_logprobs = logits_output.next_token_logprobs
+        else:
+            next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+        self.token_to_kv_pool.free_group_begin()
+
+        # Check finish condition
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if req.is_retracted:
+                continue
+
+            if self.enable_overlap and req.finished():
+                # Free the one delayed token
+                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
+                continue
+
+            if batch.spec_algorithm.is_none():
+                # speculative worker will solve the output_ids in speculative decoding
+                req.output_ids.append(next_token_id)
+
+            req.check_finished()
+
+            if req.finished():
+                # New code: calculate the request QoE
+                service_qoe = self.calc_qoe(req)
+                print(f"Request {req.rid} end with QoE {service_qoe}")
+                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
+                self.tree_cache.cache_finished_req(req)
+
+            if req.return_logprob:
+                req.output_token_logprobs_val.append(next_token_logprobs[i])
+                req.output_token_logprobs_idx.append(next_token_id)
+                if req.top_logprobs_num > 0:
+                    req.output_top_logprobs_val.append(
+                        logits_output.next_token_top_logprobs_val[i]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        logits_output.next_token_top_logprobs_idx[i]
+                    )
+
+            if (
+                self.server_args.return_hidden_states
+                and logits_output.hidden_states is not None
+            ):
+                req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
+
+            if req.grammar is not None:
+                req.grammar.accept_token(next_token_id)
+                req.grammar.finished = req.finished()
+
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            self.current_stream.synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
+
+        self.stream_output(batch.reqs, batch.return_logprob)
+
+        self.token_to_kv_pool.free_group_end()
+
+        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        if (
+            self.attn_tp_rank == 0
+            and self.forward_ct_decode % self.server_args.decode_log_interval == 0
+        ):
+            self.log_decode_stats()
 
     def process_batch_result_prefill(self, batch, result):
         for req in batch.reqs:
@@ -663,15 +738,10 @@ class AdaptiveScheduler(Scheduler):
                 self.decode_time_stamp[req.rid] = [time.time()]
             else:
                 self.decode_time_stamp[req.rid].append(time.time())
-
-            req.check_finished()
-            if req.finished():
-                service_qoe = self.calc_qoe(req)
-                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
         return super().process_batch_result_prefill(batch, result)
 
 
-def run_adaptive_scheduler_process(
+def run_andes_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     gpu_id: int,
@@ -701,7 +771,7 @@ def run_adaptive_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = AdaptiveScheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = AndesScheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(
             {
                 "status": "ready",
