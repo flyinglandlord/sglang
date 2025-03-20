@@ -27,6 +27,8 @@ import signal
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
+from python.sglang.srt.managers.my_scheduler import run_my_scheduler_process
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -382,9 +384,14 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[StdOrchestrator, Dict
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
-            if server_args.enable_custom_scheduler:
+            if server_args.enable_scheduler == "andes":
                 proc = mp.Process(
                     target=run_andes_scheduler_process,
+                    args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                )
+            elif server_args.enable_scheduler == "custom":
+                proc = mp.Process(
+                    target=run_my_scheduler_process,
                     args=(server_args, port_args, gpu_id, tp_rank, None, writer),
                 )
             else:

@@ -26,7 +26,7 @@ class HiChunkCache(ChunkCache):
             req_to_token_pool.size,
             req_to_token_pool.max_context_len,
             device="cpu",
-            enable_memory_saver=req_to_token_pool.enable_memory_saver,
+            enable_memory_saver=False,
         )
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host
@@ -35,8 +35,8 @@ class HiChunkCache(ChunkCache):
     
     def reset(self):
         super().reset()
-        self.token_to_kv_pool_host.reset()
-        self.req_to_token_pool_host.reset()
+        self.token_to_kv_pool_host.clear()
+        self.req_to_token_pool_host.clear()
 
     def write_backup(self, req: Req):
         req_pool_idx = self.req_to_token_pool_host.alloc(1)

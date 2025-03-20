@@ -71,7 +71,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     prefill_only_one_req: bool = False
-    enable_custom_scheduler: bool = False
+    enable_scheduler: str = "default"
 
     # Other runtime options
     tp_size: int = 1
@@ -501,9 +501,9 @@ class ServerArgs:
             default=ServerArgs.prefill_only_one_req,
         )
         parser.add_argument(
-            "--enable-custom-scheduler",
-            action="store_true",
-            default=ServerArgs.enable_custom_scheduler,
+            "--enable-scheduler",
+            type=str,
+            default=ServerArgs.enable_scheduler,
             help="Enable custom scheduler for the requests.",
         )
 
