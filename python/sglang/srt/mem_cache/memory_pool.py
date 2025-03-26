@@ -127,6 +127,11 @@ class BaseTokenToKVPool:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        # check the elements in free index already exist in the self.free_slots
+        if torch.isin(self.free_slots, free_index.to(self.free_slots.device)).any():
+            print(self.free_slots, free_index)
+            assert False, \
+                f"Double free token location: {torch.isin(self.free_slots, free_index.to(self.free_slots.device))}"
 
         if self.is_not_in_free_group:
             self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
@@ -589,7 +594,8 @@ class MLATokenToKVPoolHost:
     def complete_io(self, indices: torch.Tensor):
         assert self.is_protected(indices), (
             f"The host memory slots should be PROTECTED during I/O operations. "
-            f"Current state: {self.get_state(indices)}"
+            f"Current state: {self.get_state(indices)}. "
+            f"Indices: {indices}"
         )
         self.mem_state[indices] = MemoryStateInt.SYNCED
 

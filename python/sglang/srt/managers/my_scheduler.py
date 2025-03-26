@@ -2,6 +2,7 @@ import faulthandler
 import logging
 import math
 import os
+import random
 import signal
 import threading
 import time
@@ -19,6 +20,7 @@ import zmq
 from python.sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS_ESTIMATION, AddReqResult, PrefillAdder
 from python.sglang.srt.mem_cache.hichunk_cache import HiChunkCache
 from python.sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from python.sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -33,19 +35,26 @@ logger = logging.getLogger(__name__)
 class MyScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.loading_queue = []
+
         self.log_batch_status = True
-        self.output_speed = 25.0
         self.decode_time_stamp = {}
         self.cum_buffer_size = {}
         self.rebuffer_time = {}
+        self.output_speed = {}
         self.last_schedule = None
         self.reschedule = False
         self.last_update_buffer = None
-        self.high_watermark = self.output_speed * 5.0
-        self.low_watermark = self.output_speed * 1.0
+        self.high_watermark_ratio = 5.0
+        self.low_watermark_ratio = 1.0
+        self.reschedule_interval = 1.0
 
         # We force the scheduler to use CPU-GPU Radix Cache
-        self.tree_cache = ChunkCache(
+        # self.tree_cache = ChunkCache(
+        #     req_to_token_pool=self.req_to_token_pool,
+        #     token_to_kv_pool=self.token_to_kv_pool,
+        # )
+        self.tree_cache = HiChunkCache(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
         )
@@ -59,8 +68,6 @@ class MyScheduler(Scheduler):
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-            if self.server_args.enable_dp_attention:
-                batch = self.prepare_dp_attn_batch(batch)
 
             self.cur_batch = batch
 
@@ -131,6 +138,7 @@ class MyScheduler(Scheduler):
     def handle_generate_request(self, recv_req):
         self.cum_buffer_size[recv_req.rid] = 0
         self.rebuffer_time[recv_req.rid] = 0.0
+        self.output_speed[recv_req.rid] = random.choice([40.0, 10.0])
         return super().handle_generate_request(recv_req)
 
     def update_buffer_size(self):
@@ -141,11 +149,11 @@ class MyScheduler(Scheduler):
             during_time = time.time() - self.last_update_buffer
             for rid in self.cum_buffer_size:
                 # print(f"{rid} {self.cum_buffer_size[rid]} {during_time} {self.output_speed}")
-                if self.cum_buffer_size[rid] - during_time * self.output_speed >= 0:
-                    self.cum_buffer_size[rid] -= during_time * self.output_speed
+                if self.cum_buffer_size[rid] - during_time * self.output_speed[rid] >= 0:
+                    self.cum_buffer_size[rid] -= during_time * self.output_speed[rid]
                 else:
                     self.rebuffer_time[rid] += during_time - \
-                        self.cum_buffer_size[rid] / self.output_speed
+                        self.cum_buffer_size[rid] / self.output_speed[rid]
                     self.cum_buffer_size[rid] = 0
             self.last_update_buffer = time.time()
 
@@ -168,8 +176,8 @@ class MyScheduler(Scheduler):
             
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
-        if self.last_batch and self.last_batch.forward_mode.is_extend() and self.reschedule:
-            print('trigger here')
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            # print('trigger batch merging')
             self.reschedule = False
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
@@ -185,29 +193,96 @@ class MyScheduler(Scheduler):
                 else:
                     self.running_batch.merge_batch(self.last_batch)
 
+        if self.running_batch is not None:
+            self.running_batch.filter_batch()
+        
+        # check the loading queue
+        if len(self.loading_queue) != 0:
+            loaded_req_list = []
+            for req in self.loading_queue:
+                if self.tree_cache.loading_complete(req.last_node):
+                    loaded_req_list.append(req)
+                    self.tree_cache.del_backup(req.rid)
+            self.loading_queue = [x for x in self.loading_queue if x not in set(loaded_req_list)]
+            if len(loaded_req_list) != 0:
+                print('here we have loaded request now!')
+                loaded_batch = ScheduleBatch.init_new(
+                    loaded_req_list,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool,
+                    self.tree_cache,
+                    self.model_config,
+                    self.enable_overlap,
+                    self.spec_algorithm,
+                    self.server_args.enable_custom_logit_processor,
+                    self.server_args.return_hidden_states,
+                )
+                loaded_batch.prepare_for_resume_decode()
+                print(f'merge loaded batch {loaded_batch}')
+                self.running_batch.merge_batch(loaded_batch)
+        
+        # Do some check
+        if self.running_batch is not None:
+            print(self.running_batch)
+            for i,req in enumerate(self.running_batch.reqs):
+                # check the running request req_to_token_pool is not available
+                if req.req_pool_idx in self.req_to_token_pool.free_slots:
+                    print(req.req_pool_idx)
+                    assert False, f"why running request {req.rid}'s req_pool_idx {req.req_pool_idx} is available??"
+                
+                # check running request token slot is released by error
+                if torch.isin(self.token_to_kv_pool.free_slots, 
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]].clone()
+                .to(self.token_to_kv_pool.free_slots.device),).any():
+                    print(self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]])
+                    assert False, \
+                    f"why running request {req.rid}'s token slots is in the free slots list??"
+            
+            # check if two running request share the token slots
+            for i in range(len(self.running_batch.reqs)):
+                for j in range(i+1, len(self.running_batch.reqs)):
+                    if torch.isin(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]], 
+                    torch.tensor(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]], 
+                                    device=(self.req_to_token_pool.req_to_token.device))).any():
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]])
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]])
+                        print('i', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]]))
+                        print('j', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]]))
+                        assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
+
         self.update_buffer_size()
 
-        if self.last_schedule is None or time.time() - self.last_schedule >= 1.0:
+        if self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval:
             self.last_schedule = time.time()
             vthrouput = self.get_valid_throughput()
+
             # sort the request, by vthroughput and rebuffer time from high to low
             sorted_req = sorted(vthrouput.keys(), key=lambda x: vthrouput[x], reverse=True)
-            before_req_nums = len(sorted_req)
+            before_req_nums = len(sorted_req) + len(self.loading_queue)
+
+            # estimate the loading tokens, because we cannot evicted them immediately
+            loading_tokens = 0
+            loading_reqs = 0
+            for req in self.loading_queue:
+                loading_reqs += 1
+                loading_tokens += len(req.output_ids) + len(req.origin_input_ids) + \
+                    max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
+
             new_prefill_list = []
             keep_decode_list = []
-            max_tokens = self.token_to_kv_pool.size
-            # print("max_tokens", max_tokens)
-            max_running_requests = self.max_running_requests
+            max_tokens = self.token_to_kv_pool.size - loading_tokens
+            max_running_requests = self.max_running_requests - loading_reqs
             max_prefill_tokens = self.max_prefill_tokens
             new_token_ratio = self.new_token_ratio
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
+            
             for req in sorted_req:
                 if self.running_batch is not None and req in self.running_batch.reqs:
                     idx = self.running_batch.reqs.index(req)
                     remain_tokens = max_tokens - seq_lens_cpu[idx] - min(
                                 (req.sampling_params.max_new_tokens - len(req.output_ids))* new_token_ratio,
-                                max(self.high_watermark - self.cum_buffer_size[req.rid], 0),
+                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0),
                             ) 
                     if remain_tokens >= 0 and max_running_requests >= 1:
                         # print("selected", req.rid, max_tokens-remain_tokens, seq_lens_cpu[idx])
@@ -220,12 +295,11 @@ class MyScheduler(Scheduler):
                     req.init_next_round_input(None)
                     remain_tokens = max_tokens - req.extend_input_len - min(
                                 (req.sampling_params.max_new_tokens - len(req.output_ids))* new_token_ratio,
-                                max(self.high_watermark - self.cum_buffer_size[req.rid], 0),
+                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0),
                             ) 
                     if remain_tokens >= 0 and \
                     max_prefill_tokens - req.extend_input_len >= 0 and \
                     max_running_requests:
-                        # print("selected", req.rid, max_tokens-remain_tokens, req.extend_input_len)
                         max_tokens = remain_tokens
                         max_prefill_tokens -= req.extend_input_len
                         new_prefill_list.append(req)
@@ -238,36 +312,52 @@ class MyScheduler(Scheduler):
             if len(new_prefill_list) == 0 and len(keep_decode_list) == 0:
                 return None
             
-            swap_out = []
-            # print(self.token_to_kv_pool.available_size())
-            # print(len(new_prefill_list), len(keep_decode_list), 
-            #       len(self.running_batch.reqs) if self.running_batch is not None else 0, len(self.waiting_queue))
             # first sweep out the running batch request not in keep_decode_list
+            swap_out = []
             if self.running_batch is not None:
+                # check the running batch has no duplicate requests
+                assert len(self.running_batch.reqs) == len(set(self.running_batch.reqs)), \
+                    "running batch has duplicate requests"
+                # get the running batch size before schedule
                 before_running_batch = len(self.running_batch.reqs)
+
                 for i, req in enumerate(self.running_batch.reqs):
+                    req.init_next_round_input(None)
                     if req not in keep_decode_list:
-                        if isinstance(self.tree_cache, ChunkCache):
+                        if isinstance(self.tree_cache, HiChunkCache):
+                            self.tree_cache.cache_evicted_req(req, seq_lens_cpu[i])
+                            self.tree_cache.evict_req(req, seq_lens_cpu[i])
+                            # print(req)
+                            # print(req.prefix_indices)
+                            req.is_retracted = True
+                        elif isinstance(self.tree_cache, ChunkCache):
                             # ChunkCache directly evict all tokens
                             token_indices = self.req_to_token_pool.req_to_token[
                                 req.req_pool_idx, : seq_lens_cpu[i]
                             ]
-                            print(seq_lens_cpu[i])
                             self.token_to_kv_pool.free(token_indices)
                             self.req_to_token_pool.free(req.req_pool_idx)
                             if req.rid in self.tree_cache.entries:
                                 del self.tree_cache.entries[req.rid]
+                            req.reset_for_retract()
                         else:
-                            assert False, "Only ChunkCache supports new scheduler"
-                        req.reset_for_retract()
+                            assert False, "Only ChunkCache and HiChunkCache supports new scheduler"
                         swap_out.append(req)
                 keep_indices = []
+                self.tree_cache.writing_check()
                 for req in keep_decode_list:
                     keep_indices.append(self.running_batch.reqs.index(req))
                 self.running_batch.filter_batch(keep_indices=keep_indices)
+
+                # check the req in swap_out is not in the running batch
+                for req in swap_out:
+                    assert req not in self.running_batch.reqs, f"request {req.rid} in running batch"
                 assert len(self.running_batch.reqs) == len(keep_indices), \
                     f"fucking filter batch function not working {len(self.running_batch.reqs)} {len(keep_indices)}"
+                
                 self.waiting_queue.extend(swap_out)
+
+                # check the running batch size is correct
                 after_running_batch = len(self.running_batch.reqs)
                 try:
                     assert before_running_batch == after_running_batch + len(swap_out), \
@@ -280,6 +370,8 @@ class MyScheduler(Scheduler):
                 self.waiting_queue = [
                     x for x in self.waiting_queue if x not in set(new_prefill_list)
                 ]
+
+                # check the total token number is valid (not exceed the GPU available size)
                 total_new_token = 0
                 for i in new_prefill_list:
                     total_new_token += i.extend_input_len
@@ -288,6 +380,30 @@ class MyScheduler(Scheduler):
                         f"new token {total_new_token} exceed the available size {self.token_to_kv_pool.available_size()}"
                 except Exception as e:
                     raise e
+                
+                # if request has been backup in cpu memory, just load it back
+                can_load_reqs_in_prefill_list = []
+                for req in new_prefill_list:
+                    # print(f"{req.is_retracted} {req.rid} {req.last_node}")
+                    # if req.is_retracted is True and req.rid in self.tree_cache.entries.keys():
+                    #     print(f'{self.tree_cache.entries[req.rid]}')
+                    if req.is_retracted is True and req.rid in self.tree_cache.entries.keys() and \
+                    self.tree_cache.entries[req.rid].backuped is True:
+                        self.tree_cache.init_load_back(req)
+                        # new_prefill_list.remove(req)
+                        can_load_reqs_in_prefill_list.append(req)
+                        self.loading_queue.append(req)
+                        req.is_retracted = False
+                
+                new_prefill_list = [x for x in new_prefill_list if x not in set(can_load_reqs_in_prefill_list)]
+                for req in new_prefill_list:
+                    req.is_retracted = False
+                    if req.rid in self.tree_cache.entries:
+                        req.reset_for_retract()
+                        del self.tree_cache.entries[req.rid]
+                    # req.init_next_round_input(None)
+                    print(f'{req.rid} trigger recompute/prefill')
+                # else, we have to do recompute
                 ret = ScheduleBatch.init_new(
                     new_prefill_list,
                     self.req_to_token_pool,
@@ -300,17 +416,43 @@ class MyScheduler(Scheduler):
                     self.server_args.return_hidden_states,
                 )
                 ret.prepare_for_extend()
+
+                # check ret.reqs request not share the same token slots
+                for i in range(len(ret.reqs)):
+                    for j in range(i+1, len(ret.reqs)):
+                        if torch.isin(self.req_to_token_pool.req_to_token[ret.reqs[i].req_pool_idx, :ret.seq_lens[i]], 
+                        self.req_to_token_pool.req_to_token[ret.reqs[j].req_pool_idx, :ret.seq_lens[j]].clone() 
+                        .to(self.req_to_token_pool.req_to_token.device)).any():
+                            print(self.tree_cache.entries.keys())
+                            assert False, f"two prefill request {ret.reqs[i].rid} and {ret.reqs[j].rid} share the same token slots"
+
+                # check ret.output_loc is available
+                if torch.isin(self.token_to_kv_pool.free_slots, ret.out_cache_loc.clone()
+                .to(self.token_to_kv_pool.free_slots.device)).any():
+                    print(len(ret.out_cache_loc))
+                    assert False, \
+                    f"output loc not available, {torch.isin(self.token_to_kv_pool.free_slots, torch.tensor(ret.out_cache_loc, device=self.token_to_kv_pool.free_slots.device))}"
+
+                # check while scheduling, no request is lost
                 current_req_nums = len(new_prefill_list) + \
                     ((len(self.running_batch.reqs)) if (self.running_batch is not None) else 0) + \
-                    ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0)
+                    ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0) + \
+                    ((len(self.loading_queue)) if (self.loading_queue is not None) else 0)
                 try:
                     assert current_req_nums == before_req_nums, \
                         f"request number not match ({current_req_nums} {before_req_nums})"
                 except Exception as e:
                     print(len(new_prefill_list), len(self.running_batch.reqs), len(self.waiting_queue))
                     raise e
-                self.reschedule = True
+
+                if ret.is_empty():
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    if self.running_batch is None or self.running_batch.is_empty():
+                        ret = None
+                    else:
+                        ret = self.running_batch
             else:
+                # check while scheduling, no request is lost
                 current_req_nums = \
                     ((len(self.running_batch.reqs)) if (self.running_batch is not None) else 0) + \
                     ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0)
@@ -320,8 +462,12 @@ class MyScheduler(Scheduler):
                 except Exception as e:
                     print(len(new_prefill_list), self.running_batch, self.waiting_queue)
                     raise e
+                
                 self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch
+                if self.running_batch is None:
+                    ret = None
+                else:
+                    ret = self.running_batch
         else:
             if self.running_batch is None:
                 ret = None
@@ -342,162 +488,25 @@ class MyScheduler(Scheduler):
         #         self.running_batch = self.update_running_batch(self.running_batch)
         #        ret = self.running_batch
 
+        # check if any request in both running batch and waiting queue
+        if self.running_batch is not None and self.waiting_queue is not None:
+            for req in self.running_batch.reqs:
+                if req in self.waiting_queue:
+                    assert False, "Request in both running batch and waiting queue"
+        
         # Handle DP attention
         if self.server_args.enable_dp_attention:
             ret = self.prepare_dp_attn_batch(ret)
-
+        
+        if ret is not None:
+            print('----------------------', file=open('tmp/debug_log.txt', 'a'))
+            for req in ret.reqs:
+                print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
+            print(f'{self.tree_cache.entries.keys()}', file=open('tmp/debug_log.txt', 'a'))
         return ret
     
     def get_new_batch_prefill(self):
-        # Check if the grammar is ready in the grammar queue
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
-
-        # Handle the cases where prefill is not allowed
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.being_chunked_req is None:
-            return None
-
-        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
-        if running_bs >= self.max_running_requests:
-            self.batch_is_full = True
-            return None
-
-        # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
-
-        # Prefill policy
-        adder = PrefillAdder(
-            self.tree_cache,
-            self.token_to_kv_pool,
-            self.running_batch,
-            self.new_token_ratio,
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-        )
-
-        has_being_chunked = self.being_chunked_req is not None
-        if has_being_chunked:
-            self.being_chunked_req.init_next_round_input()
-            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
-
-        if self.lora_paths:
-            lora_set = (
-                set([req.lora_path for req in self.running_batch.reqs])
-                if self.running_batch is not None
-                else set([])
-            )
-
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
-            if (
-                self.lora_paths
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
-            ):
-                self.batch_is_full = True
-                break
-
-            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
-                self.batch_is_full = True
-                break
-
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
-
-            if self.enable_hierarchical_cache and req.last_node is not None:
-                if req.last_node.evicted:
-                    # loading KV cache for the request
-                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                        req.last_node,
-                        req.prefix_indices,
-                        adder.rem_total_tokens,
-                    )
-                    if req.last_node.loading:
-                        # to prevent frequent cache invalidation
-                        if req.rid in self.staging_reqs:
-                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                        self.tree_cache.inc_lock_ref(req.last_node)
-                        self.staging_reqs[req.rid] = req.last_node
-                        continue
-                elif req.last_node.loading:
-                    if not self.tree_cache.loading_complete(req.last_node):
-                        continue
-
-                if req.rid in self.staging_reqs:
-                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                    del self.staging_reqs[req.rid]
-
-            res = adder.add_one_req(req)
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.batch_is_full = len(adder.can_run_list) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
-                    else:
-                        self.batch_is_full = True
-                break
-            if self.server_args.prefill_only_one_req:
-                break
-
-        # Update waiting queue
-        can_run_list = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
-
-        if adder.new_being_chunked_req is not None:
-            assert self.being_chunked_req is None
-            self.being_chunked_req = adder.new_being_chunked_req
-
-        if self.being_chunked_req:
-            self.being_chunked_req.is_being_chunked += 1
-
-        # Print stats
-        if self.attn_tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
-
-        # Create a new batch
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
-        )
-        new_batch.prepare_for_extend()
-
-        # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and self.running_batch is not None
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
-        ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch()
-            if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
-            self.running_batch = None
-        else:
-            new_batch.decoding_reqs = None
-
-        return new_batch
+        return super().get_new_batch_prefill()
     
     def process_batch_result_decode(self, batch: ScheduleBatch, result):
         # update the virtual buffer size & decode time stamp

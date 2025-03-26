@@ -16,10 +16,16 @@ class ChunkCacheEntry:
         self.rid = rid
         self.value = value
 
+        # normally, it could be none, but if the request are evicted from host memory,
+        # we need to set it for retracting the request.
+        self.req = None
         # indicate whether the cache entry is evicted
         self.evicted = False
         # indicate whether the cache entry is backup to the host memory
         self.backuped = False
+        # indicate whether the cache entry is loading
+        self.loading = False
+        
         self.host_value = None
         self.host_req_pool_idx = None
 

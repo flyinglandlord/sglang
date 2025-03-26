@@ -535,7 +535,7 @@ class Req:
     def __repr__(self):
         return (
             f"rid(n={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}"
+            f"input_ids={len(self.origin_input_ids)}, output_ids={self.output_ids}, prefix_indices={len(self.prefix_indices)})"
         )
 
 
@@ -749,6 +749,75 @@ class ScheduleBatch:
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
+    def prepare_for_resume_decode(self):
+        self.forward_mode = ForwardMode.DECODE
+        if self.spec_algorithm.is_eagle():
+            return
+        
+        bs = len(self.reqs)
+        self.output_ids = torch.tensor(
+            [r.output_ids[-1] for r in self.reqs], 
+            dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+
+        input_embeds = []
+        reqs = self.reqs
+        seq_lens = []
+
+        req_pool_indices = []
+        for i, req in enumerate(reqs):
+            req_pool_indices.append(req.req_pool_idx)
+            
+            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            seq_lens.append(seq_len)
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+
+            req.already_computed = seq_len
+            req.is_retracted = False
+
+        # Set fields
+        self.input_ids = None
+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
+        )
+
+        for i in range(bs):
+            assert len(self.tree_cache.entries[self.reqs[i].rid].value) == self.seq_lens[i], \
+                f"something wrong with the tree cache: token slots number not equal {self.tree_cache.entries[self.req[i].rid].values} and {self.seq_lens[i]}"
+            self.req_to_token_pool.write(
+                (self.req_pool_indices[i], slice(0, self.seq_lens[i])),
+                self.tree_cache.entries[self.reqs[i].rid].value,
+            )
+
+        self.out_cache_loc = None
+
+        self.seq_lens_sum = sum(seq_lens)
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
+        self.extend_lens = [r.extend_input_len for r in reqs]
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+            enable_overlap_schedule=self.enable_overlap,
+        )
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -770,7 +839,8 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
-            assert seq_len - pre_len == req.extend_input_len, f"{req.rid}: {seq_len} - {pre_len} != {req.extend_input_len}"
+            assert seq_len - pre_len == req.extend_input_len, \
+                f"{req.rid}: {seq_len} - {pre_len} != {req.extend_input_len}"
 
             if pre_len > 0:
                 self.req_to_token_pool.write(

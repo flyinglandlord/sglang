@@ -38,6 +38,8 @@ class AndesScheduler(Scheduler):
         self.avg_prefill_time = 0.1
         self.reschedule_interval = 0.1
         self.last_reschedule_time = None
+        self.selected_Q_service = {}
+        self.selected_Q_wait = {}
     
     def predict_prefill_time(self, x, y, z):
         # Prefill time: coef [-9.42713569e-04  5.61623220e-06  2.46562667e-05] 
@@ -60,8 +62,6 @@ class AndesScheduler(Scheduler):
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-            if self.server_args.enable_dp_attention:
-                batch = self.prepare_dp_attn_batch(batch)
 
             self.cur_batch = batch
 
@@ -71,6 +71,16 @@ class AndesScheduler(Scheduler):
                         if (batch.decoding_reqs is not None and req not in batch.decoding_reqs) or batch.decoding_reqs is None:
                             print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
                     print('', file=open('tmp/batch_detail.txt', 'a'))
+                    # for req in batch.reqs:
+                    #     if (batch.decoding_reqs is not None and req not in batch.decoding_reqs) or batch.decoding_reqs is None:
+                    #         if req.rid in self.selected_Q_service:
+                    #             print(f'{self.selected_Q_service[req.rid]}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                    # print('', file=open('tmp/batch_detail.txt', 'a'))
+                    # for req in batch.reqs:
+                    #     if (batch.decoding_reqs is not None and req not in batch.decoding_reqs) or batch.decoding_reqs is None:
+                    #         if req.rid in self.selected_Q_wait:
+                    #             print(f'{self.selected_Q_wait[req.rid]}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                    # print('', file=open('tmp/batch_detail.txt', 'a'))
                     if batch.decoding_reqs is not None:
                         for req in batch.decoding_reqs:
                             print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
@@ -164,8 +174,6 @@ class AndesScheduler(Scheduler):
             self.last_batch = batch
 
     def is_time_to_reschedule(self):
-        if not self.batch_is_full:
-            return False
         if self.last_reschedule_time is None:
             self.last_reschedule_time = time.time()
             return False
@@ -219,6 +227,7 @@ class AndesScheduler(Scheduler):
         Q = None
         
         if output_len != 0:
+            recv_time = T_output[0]
             T_ideal = [recv_time + i / output_speed for i in range(output_len)]
             T_actual = [T_output[0]]
 
@@ -238,8 +247,10 @@ class AndesScheduler(Scheduler):
                 else:
                     T_actual.append(T_output[i])
         
-            Q = 1 - sum([(T_actual[i] - T_ideal[i]) for i in range(len(T_output))]) \
-                / sum([(T_actual[-1] - T_ideal[i]) for i in range(len(T_output))])
+            A = sum([(T_actual[-1] - T_ideal[i]) for i in range(len(T_output) - pred_decode_token)])
+            if A == 0:
+                A = 0.01
+            Q = 1 - sum([(T_actual[i] - T_ideal[i]) for i in range(len(T_output))]) / A
         else:
             assert no_pred == False, "The request has no output but we need to calculate the QoE"
             if B == -1:
@@ -254,15 +265,13 @@ class AndesScheduler(Scheduler):
         Q_wait = {}
         Q_service = {}
         for req in self.running_batch.reqs:
-            if not req.finished():
-                Q_service[req.rid] = self.predict_request_QoE(req, B)
-                Q_wait[req.rid] = self.predict_request_QoE(req, -1)
-                schedulable.append(req)
+            Q_service[req.rid] = self.predict_request_QoE(req, B)
+            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
+            schedulable.append(req)
         for req in self.waiting_queue:
-            if not req.finished():
-                Q_service[req.rid] = self.predict_request_QoE(req, B)
-                Q_wait[req.rid] = self.predict_request_QoE(req, -1)
-                schedulable.append(req)
+            Q_service[req.rid] = self.predict_request_QoE(req, B)
+            Q_wait[req.rid] = self.predict_request_QoE(req, -1)
+            schedulable.append(req)
 
         # sort the request by the (Q_wait - Q_service) / request_length
         priority = [(req, (Q_service[req.rid] - Q_wait[req.rid]) / (len(req.output_ids) + len(req.origin_input_ids)))  \
@@ -273,7 +282,7 @@ class AndesScheduler(Scheduler):
         # self.new_token_ratio
         # self.token_to_kv_pool.size
         # self.max_prefill_tokens
-        max_tokens = self.token_to_kv_pool.size
+        max_tokens = self.max_total_num_tokens
         max_running_requests = B
         max_prefill_tokens = self.max_prefill_tokens
         new_token_ratio = self.new_token_ratio
@@ -285,48 +294,37 @@ class AndesScheduler(Scheduler):
         for i, (req, pri) in enumerate(priority):
             if req in self.running_batch.reqs:
                 idx = self.running_batch.reqs.index(req)
-                remain_tokens = max_tokens - seq_lens_cpu[idx] - min(
-                            (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                            self.reschedule_interval // self.predict_decode_time(B) + 3,
-                        ) * new_token_ratio
+                remain_tokens = max_tokens - seq_lens_cpu[idx] - max(
+                    min(max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION) * new_token_ratio, 
+                        self.reschedule_interval // self.predict_decode_time(B) + 3)
                 if remain_tokens >= 0 and max_running_requests >= 1:
                     max_tokens = remain_tokens
                     selected.append(req)
                     qoe_gain += (Q_wait[req.rid] - Q_service[req.rid])
-                    total_tokens += seq_lens_cpu[idx] + min(
-                            (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                        ) * new_token_ratio
+                    total_tokens += seq_lens_cpu[idx] + 1
                     max_running_requests -= 1
                 else:
                     continue
             else:
                 req.init_next_round_input(None)
-                remain_tokens = max_tokens - req.extend_input_len - min(
-                            (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                            self.reschedule_interval // self.predict_decode_time(B) + 3
-                        ) * new_token_ratio
+                remain_tokens = max_tokens - req.extend_input_len - max(
+                    min(max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION) * new_token_ratio, 
+                        self.reschedule_interval // self.predict_decode_time(B) + 3)
                 if remain_tokens >= 0 and \
                     max_prefill_tokens - req.extend_input_len >= 0 and \
-                    max_running_requests:
+                    max_running_requests >= 1:
                     max_tokens = remain_tokens
                     max_prefill_tokens -= req.extend_input_len
                     selected.append(req)
                     qoe_gain += (Q_wait[req.rid] - Q_service[req.rid])
-                    total_tokens += req.extend_input_len + min(
-                            (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                        )
-                    new_tokens += req.extend_input_len + min(
-                            (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                        )
+                    total_tokens += req.extend_input_len
+                    new_tokens += req.extend_input_len
                     max_running_requests -= 1
                 else:
                     continue
-        return selected, qoe_gain, total_tokens, new_tokens
+        return selected, qoe_gain, total_tokens, new_tokens, Q_service, Q_wait
 
         
     def reschedule_requests(self):
@@ -336,7 +334,7 @@ class AndesScheduler(Scheduler):
         max_selected = None
         max_batch_size = -1
         max_total_tokens = 0
-        max_new_tokens = 0
+        max_new_tokens = 0 
         
         # pre-determine the Bmin and Bmax
         Bmin = 1
@@ -365,7 +363,8 @@ class AndesScheduler(Scheduler):
         # logger.info(f"Predicted Bmin: {Bmin}, Bmax: {Bmax}")
 
         for B in range(min(Bmin-3, Bmax), Bmax+1):
-            selected, qoe_gain, total_tokens, new_tokens = self.reschedule_requests_with_batch_size(B)
+            selected, qoe_gain, total_tokens, new_tokens, q_service, q_wait = \
+                self.reschedule_requests_with_batch_size(B)
             # print(qoe_gain)
             if qoe_gain > max_qoe_gain:
                 max_qoe_gain = qoe_gain
@@ -373,24 +372,42 @@ class AndesScheduler(Scheduler):
                 max_batch_size = len(selected)
                 max_total_tokens = total_tokens
                 max_new_tokens = new_tokens
+                self.selected_Q_service = q_service
+                self.selected_Q_wait = q_wait
         # logger.info(f"Max QoE gain: {max_qoe_gain}, batch size: {max_batch_size}")
         self.last_reschedule_time = time.time()
 
-        can_run_list = []
+        if max_selected is None or len(max_selected) == 0:
+            return None
+
+        assert len(max_selected) == len(set(max_selected)), \
+            "The selected requests have duplicates"
+        
+        assert len(self.waiting_queue + self.running_batch.reqs) == len(set(self.waiting_queue + self.running_batch.reqs)), \
+            f"The total requests have duplicates {len(self.waiting_queue)} {len(self.running_batch.reqs)}"
+
+        selected_total_tokens = 0
+        for i in max_selected:
+            if i in self.waiting_queue:
+                selected_total_tokens += i.extend_input_len
+            else:
+                selected_total_tokens += len(i.fill_ids)
+        assert selected_total_tokens <= self.token_to_kv_pool.size, \
+            f"schedule tokens {selected_total_tokens} exceed the total kv pool size {self.token_to_kv_pool.size}"
+
+        new_prefill_list = []
+        keep_decode_list = []
         for r in max_selected:
             if r not in self.running_batch.reqs:
-                can_run_list.append(r)
-        if len(can_run_list) == 0:
-            return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+                new_prefill_list.append(r)
+            else:
+                keep_decode_list.append(r)
 
         # clear the request not in the selected list
         seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
         swap_out = []
         for i, req in enumerate(self.running_batch.reqs):
-            if req not in max_selected:
+            if req not in keep_decode_list:
                 if isinstance(self.tree_cache, ChunkCache):
                     # ChunkCache directly evict all tokens
                     token_indices = self.req_to_token_pool.req_to_token[
@@ -402,34 +419,42 @@ class AndesScheduler(Scheduler):
                         del self.tree_cache.entries[req.rid]
                 else:
                     assert False, "Only ChunkCache supports new scheduler"
-                
                 req.reset_for_retract()
-
                 swap_out.append(req)
         keep_indices = []
-        for i in range(len(self.running_batch.reqs)):
-            if self.running_batch.reqs[i] in max_selected:
-                keep_indices.append(i)
+        for req in keep_decode_list:
+            keep_indices.append(self.running_batch.reqs.index(req))
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.waiting_queue.extend(swap_out)
 
+        total_new_tokens = 0
+        for req in new_prefill_list:
+            total_new_tokens += req.extend_input_len
+        assert total_new_tokens <= self.token_to_kv_pool.available_size(), \
+            f"Total new tokens {total_new_tokens} exceed the available size {self.token_to_kv_pool.available_size()}"
         # Log the new_batch information
         # logger.info("Re-schedule batch. #rescheduled-seq: %d. running-seq: %d. total-tokens: %d. new-tokens: %d" % 
         #             (len(can_run_list), len(self.running_batch.reqs), max_total_tokens, max_new_tokens))
-        
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
-            self.server_args.return_hidden_states,
-        )
-        new_batch.prepare_for_extend()
-        self.batch_is_full = True
+
+        if len(new_prefill_list) != 0:
+            self.waiting_queue = [
+                x for x in self.waiting_queue if x not in set(new_prefill_list)
+            ]
+            new_batch = ScheduleBatch.init_new(
+                new_prefill_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                self.server_args.enable_custom_logit_processor,
+                self.server_args.return_hidden_states,
+            )
+            new_batch.prepare_for_extend()
+            self.batch_is_full = True
+        else:
+            new_batch = None
         # Mixed-style chunked prefill
         # if (
         #     self.is_mixed_chunk
@@ -464,6 +489,12 @@ class AndesScheduler(Scheduler):
                     self.running_batch = self.last_batch
                 else:
                     self.running_batch.merge_batch(self.last_batch)
+        
+        # check a request is exist in waiting queue and running batch at the same time
+        if self.waiting_queue is not None and self.running_batch is not None:
+            for req in self.waiting_queue:
+                if req in self.running_batch.reqs:
+                    assert False, "The request is in the waiting queue and running batch at the same time"
 
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
@@ -689,10 +720,10 @@ class AndesScheduler(Scheduler):
             req.check_finished()
 
             if req.finished():
-                # New code: calculate the request QoE
-                service_qoe = self.calc_qoe(req)
-                print(f"Request {req.rid} end with QoE {service_qoe}")
-                print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
+            #     # New code: calculate the request QoE
+            #     service_qoe = self.calc_qoe(req)
+            #     print(f"Request {req.rid} end with QoE {service_qoe}")
+            #     print(f"{req.rid}, {service_qoe}", file=open('tmp/service_qoe.txt', 'a'))
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
