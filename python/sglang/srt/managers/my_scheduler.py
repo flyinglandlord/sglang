@@ -49,7 +49,7 @@ class MyScheduler(Scheduler):
         self.low_watermark_ratio = 1.0
         self.reschedule_interval = 1.0
 
-        self.runtime_check = True
+        self.runtime_check = False
 
         # We force the scheduler to use CPU-GPU Radix Cache
         # self.tree_cache = ChunkCache(
@@ -141,7 +141,7 @@ class MyScheduler(Scheduler):
         self.cum_buffer_size[recv_req.rid] = 0
         self.rebuffer_time[recv_req.rid] = 0.0
         # self.output_speed[recv_req.rid] = random.choice([40.0, 10.0])
-        self.output_speed[recv_req.rid] = 5.0
+        self.output_speed[recv_req.rid] = 10.0
         return super().handle_generate_request(recv_req)
 
     def update_buffer_size(self):
@@ -214,6 +214,7 @@ class MyScheduler(Scheduler):
             for req in self.loading_queue:
                 if self.sync_cache.load_check(req):
                     loaded_req_list.append(req)
+            print(self.sync_cache.req_write_op_count.values())
             self.loading_queue = [x for x in self.loading_queue if x not in set(loaded_req_list)]
             if len(loaded_req_list) != 0:
                 # print('here we have loaded request now!')
@@ -265,6 +266,9 @@ class MyScheduler(Scheduler):
                         assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
 
         self.update_buffer_size()
+        
+        if self.running_batch and len(self.running_batch.reqs) > 0:
+            print(f'running size: {len(self.running_batch.reqs) if self.running_batch is not None else 0}, waiting size: {len(self.waiting_queue) if self.waiting_queue is not None else 0}, loading size: {len(self.loading_queue)}')
 
         if self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval:
             self.last_schedule = time.time()
@@ -291,12 +295,13 @@ class MyScheduler(Scheduler):
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
             
+            min_reserved_output_len = 16
             for req in sorted_req:
                 if self.running_batch is not None and req in self.running_batch.reqs:
                     idx = self.running_batch.reqs.index(req)
                     remain_tokens = max_tokens - seq_lens_cpu[idx] - min(
                                 (req.sampling_params.max_new_tokens - len(req.output_ids))* new_token_ratio,
-                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0),
+                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], min_reserved_output_len),
                             ) 
                     if remain_tokens >= 0 and max_running_requests >= 1:
                         # print("selected", req.rid, max_tokens-remain_tokens, seq_lens_cpu[idx])
@@ -311,7 +316,7 @@ class MyScheduler(Scheduler):
                     req_len = len(req.fill_ids) if req.fill_ids else req.extend_input_len 
                     remain_tokens = max_tokens - req_len - min(
                                 (req.sampling_params.max_new_tokens - len(req.output_ids))* new_token_ratio,
-                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0),
+                                max(self.high_watermark_ratio * self.output_speed[req.rid] - self.cum_buffer_size[req.rid], min_reserved_output_len),
                             ) 
                     if remain_tokens >= 0 and \
                     max_prefill_tokens - req.extend_input_len >= 0 and \
