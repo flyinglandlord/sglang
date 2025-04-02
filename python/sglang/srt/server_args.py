@@ -171,6 +171,8 @@ class ServerArgs:
 
     enable_flashinfer_mla: bool = False
 
+    pod_attn_strategy: str = "enforce-single-prefill"
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -937,6 +939,13 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--pod-attn-strategy",
+            type=str,
+            choices=["enforce-single-prefill", "no-pod-with-multi-prefill"],
+            default=ServerArgs.pod_attn_strategy,
+            help="Specify the strategy for handling POD attention. Options include: 'enforce-single-prefill' and 'no-pod-with-multi-prefill'.",
         )
 
     @classmethod
