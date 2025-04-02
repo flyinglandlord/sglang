@@ -216,7 +216,7 @@ class MyScheduler(Scheduler):
                     loaded_req_list.append(req)
             self.loading_queue = [x for x in self.loading_queue if x not in set(loaded_req_list)]
             if len(loaded_req_list) != 0:
-                print('here we have loaded request now!')
+                # print('here we have loaded request now!')
                 loaded_batch = ScheduleBatch.init_new(
                     loaded_req_list,
                     self.req_to_token_pool,
@@ -366,8 +366,6 @@ class MyScheduler(Scheduler):
                     keep_decode_kv_size += seq_lens_cpu[idx]
                 self.running_batch.filter_batch(keep_indices=keep_indices)
 
-                print(f'keep decode length: {keep_decode_kv_size}')
-
                 # check the req in swap_out is not in the running batch
                 for req in swap_out:
                     assert req not in self.running_batch.reqs, f"request {req.rid} in running batch"
@@ -395,7 +393,6 @@ class MyScheduler(Scheduler):
                 for i in new_prefill_list:
                     total_new_token += i.extend_input_len
                 try:
-                    print(f'total new token: {total_new_token}')
                     assert total_new_token <= self.token_to_kv_pool.available_size(), \
                         f"new token {total_new_token} exceed the available size {self.token_to_kv_pool.available_size()}"
                 except Exception as e:
@@ -472,7 +469,8 @@ class MyScheduler(Scheduler):
                 # check while scheduling, no request is lost
                 current_req_nums = \
                     ((len(self.running_batch.reqs)) if (self.running_batch is not None) else 0) + \
-                    ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0)
+                    ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0) + \
+                    ((len(self.loading_queue)) if (self.loading_queue is not None) else 0)
                 try:
                     assert current_req_nums == before_req_nums, \
                         f"request number not match ({current_req_nums} {before_req_nums})"
