@@ -50,6 +50,7 @@ class MyScheduler(Scheduler):
         self.reschedule_interval = 1.0
 
         self.runtime_check = False
+        self.debug_log = False
 
         # We force the scheduler to use CPU-GPU Radix Cache
         # self.tree_cache = ChunkCache(
@@ -140,8 +141,8 @@ class MyScheduler(Scheduler):
     def handle_generate_request(self, recv_req):
         self.cum_buffer_size[recv_req.rid] = 0
         self.rebuffer_time[recv_req.rid] = 0.0
-        # self.output_speed[recv_req.rid] = random.choice([40.0, 10.0])
-        self.output_speed[recv_req.rid] = 10.0
+        self.output_speed[recv_req.rid] = random.choice([40.0, 10.0])
+        # self.output_speed[recv_req.rid] = 10.0
         return super().handle_generate_request(recv_req)
 
     def update_buffer_size(self):
@@ -180,7 +181,6 @@ class MyScheduler(Scheduler):
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            # print('trigger batch merging')
             self.reschedule = False
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
@@ -195,6 +195,12 @@ class MyScheduler(Scheduler):
                     self.running_batch = self.last_batch
                 else:
                     self.running_batch.merge_batch(self.last_batch)
+            if self.debug_log:
+                print('trigger prefill batch merging, after merge prefill: ', file=open('tmp/debug_log.txt', 'a'))
+                for req in self.running_batch.reqs:
+                    print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
+                print(self.running_batch.seq_lens, file=open('tmp/debug_log.txt', 'a'))
+
 
         # write all updates to the sync cache
         if self.last_batch:
@@ -216,6 +222,9 @@ class MyScheduler(Scheduler):
                     loaded_req_list.append(req)
             print(self.sync_cache.req_write_op_count.values())
             self.loading_queue = [x for x in self.loading_queue if x not in set(loaded_req_list)]
+            if self.debug_log:
+                for req in loaded_req_list:
+                    print(f'loaded request {req.rid}, length {len(req.output_ids) + len(req.origin_input_ids)}', file=open('tmp/mem_log.log', 'a+'))
             if len(loaded_req_list) != 0:
                 # print('here we have loaded request now!')
                 loaded_batch = ScheduleBatch.init_new(
@@ -230,11 +239,16 @@ class MyScheduler(Scheduler):
                     self.server_args.return_hidden_states,
                 )
                 loaded_batch.prepare_for_resume_decode()
-                print(f'merge loaded batch {loaded_batch}')
+                if self.debug_log: print(f'merge loaded batch {loaded_batch}')
                 if self.running_batch is None: # the running batch is empty, weird
                     self.running_batch = loaded_batch
                 else:
                     self.running_batch.merge_batch(loaded_batch)
+            if self.debug_log:
+                print('trigger loaded batch merging, after merge loaded request: ', file=open('tmp/debug_log.txt', 'a'))
+                for req in self.running_batch.reqs:
+                    print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
+                print(self.running_batch.seq_lens, file=open('tmp/debug_log.txt', 'a'))
         
         # Do some check
         if self.runtime_check and self.running_batch is not None:
@@ -343,12 +357,18 @@ class MyScheduler(Scheduler):
                 before_running_batch = len(self.running_batch.reqs)
 
                 for i, req in enumerate(self.running_batch.reqs):
-                    req.init_next_round_input(None)
+                    # req.init_next_round_input(None)
                     if req not in keep_decode_list:
                         if isinstance(self.sync_cache, SyncChunkCache):
-                            self.sync_cache.wait_write(req)
-                            self.sync_cache.evict_device(req, seq_lens_cpu[i])
-                            # print(f"evict {req.rid} from device")
+                            if self.debug_log: print(f"evict {req.rid} from device, length {seq_lens_cpu[i]}", file=open('tmp/mem_log.log', 'a+'))
+                            try:
+                                self.sync_cache.wait_write(req)
+                                self.sync_cache.evict_device(req, seq_lens_cpu[i])
+                            except Exception as e:
+                                for req in self.running_batch.reqs:
+                                    print(f'{req}')
+                                print(seq_lens_cpu)
+                                raise e
                         elif isinstance(self.sync_cache, ChunkCache):
                             # ChunkCache directly evict all tokens
                             token_indices = self.req_to_token_pool.req_to_token[
@@ -375,7 +395,7 @@ class MyScheduler(Scheduler):
                 for req in swap_out:
                     assert req not in self.running_batch.reqs, f"request {req.rid} in running batch"
                 assert len(self.running_batch.reqs) == len(keep_indices), \
-                    f"fucking filter batch function not working {len(self.running_batch.reqs)} {len(keep_indices)}"
+                    f"filter batch function not working {len(self.running_batch.reqs)} {len(keep_indices)}"
                 
                 self.waiting_queue.extend(swap_out)
 
@@ -387,6 +407,9 @@ class MyScheduler(Scheduler):
                 except Exception as e:
                     print(keep_decode_list, swap_out, keep_indices)
                     raise e
+
+                if self.running_batch.is_empty():
+                    self.running_batch = None
             
             if len(new_prefill_list) != 0:
                 self.waiting_queue = [
@@ -465,11 +488,11 @@ class MyScheduler(Scheduler):
                     raise e
 
                 if ret.is_empty():
-                    self.running_batch = self.update_running_batch(self.running_batch)
-                    if self.running_batch is None or self.running_batch.is_empty():
-                        ret = None
-                    else:
-                        ret = self.running_batch
+                    if self.running_batch is not None:
+                        self.running_batch = self.update_running_batch(self.running_batch)
+                    elif self.running_batch is None or self.running_batch.is_empty():
+                        self.running_batch = None
+                    ret = self.running_batch
             else:
                 # check while scheduling, no request is lost
                 current_req_nums = \
@@ -509,20 +532,27 @@ class MyScheduler(Scheduler):
         #        ret = self.running_batch
 
         # check if any request in both running batch and waiting queue
-        if self.running_batch is not None and self.waiting_queue is not None:
-            for req in self.running_batch.reqs:
-                if req in self.waiting_queue:
-                    assert False, "Request in both running batch and waiting queue"
+        if self.runtime_check:
+            if self.running_batch is not None and self.waiting_queue is not None:
+                for req in self.running_batch.reqs:
+                    if req in self.waiting_queue:
+                        assert False, "Request in both running batch and waiting queue"
         
         # Handle DP attention
         if self.server_args.enable_dp_attention:
             ret = self.prepare_dp_attn_batch(ret)
         
-        if ret is not None:
+        if ret is not None and self.debug_log:
             print('----------------------', file=open('tmp/debug_log.txt', 'a'))
             for req in ret.reqs:
                 print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
             print(f'{self.sync_cache.entries.keys()}', file=open('tmp/debug_log.txt', 'a'))
+            print(f'{ret.seq_lens}', file=open('tmp/debug_log.txt', 'a'))
+            if self.running_batch is not None and ret != self.running_batch:
+                print(f'Running batch: ', file=open('tmp/debug_log.txt', 'a'))
+                for req in self.running_batch.reqs:
+                    print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
+                print(f"{self.running_batch.seq_lens}", file=open('tmp/debug_log.txt', 'a'))
         return ret
     
     def get_new_batch_prefill(self):
