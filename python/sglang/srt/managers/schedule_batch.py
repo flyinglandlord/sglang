@@ -535,7 +535,7 @@ class Req:
     def __repr__(self):
         return (
             f"rid(n={self.rid}, "
-            f"input_ids={len(self.origin_input_ids)}, output_ids={self.output_ids}, prefix_indices={len(self.prefix_indices)})"
+            f"input_ids={len(self.origin_input_ids)}, output_ids={self.output_ids}, prefix_indices={len(self.prefix_indices)}, fill_ids={len(self.fill_ids)})"
         )
 
 
@@ -782,13 +782,13 @@ class ScheduleBatch:
         # Set fields
         self.input_ids = None
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
+            self.device
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
-            self.device, non_blocking=True
+            self.device
         )
         self.input_embeds = (
-            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            torch.tensor(input_embeds).to(self.device)
             if input_embeds
             else None
         )

@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=4,6 \
-python3 -m sglang.launch_server --model-path /mnt/nvme0/models/Meta-Llama-3-8B \
-    --port 8888 --disable-radix-cache --disable-overlap-schedule \
+CUDA_VISIBLE_DEVICES=0 \
+python3 -m sglang.launch_server --model-path /mtc/chenjunyi/models/llama3-8b \
+    --port 8888 --disable-radix-cache --disable-overlap-schedule --trust-remote-code \
     --mem-fraction-static 0.3 --enable-scheduler custom # --enable-mixed-chunk 

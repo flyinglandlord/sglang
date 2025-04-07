@@ -25,7 +25,7 @@ class SyncChunkCache(ChunkCache):
     def __init__(
         self, req_to_token_pool: ReqToTokenPool, token_to_kv_pool: BaseTokenToKVPool
     ):
-        self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool, host_to_device_ratio=8.0)
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host
         )

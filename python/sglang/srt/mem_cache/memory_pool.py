@@ -125,12 +125,17 @@ class BaseTokenToKVPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
+        # torch.set_printoptions(profile="full")
+        # print(f'alloc {select_index}', file=open('tmp/mem_log.log', 'a+'))
+        # torch.set_printoptions(profile="default")
         return select_index.to(self.device, non_blocking=True)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        # torch.set_printoptions(profile="full")
+        # print(f'free {free_index}', file=open('tmp/mem_log.log', 'a+'))
+        # torch.set_printoptions(profile="default")
         # check the elements in free index already exist in the self.free_slots
         if torch.isin(self.free_slots, free_index.to(self.free_slots.device)).any():
             print(self.free_slots, free_index)
