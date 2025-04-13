@@ -786,13 +786,13 @@ class ScheduleBatch:
         # Set fields
         self.input_ids = None
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
+            self.device
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
-            self.device, non_blocking=True
+            self.device
         )
         self.input_embeds = (
-            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            torch.tensor(input_embeds).to(self.device)
             if input_embeds
             else None
         )
