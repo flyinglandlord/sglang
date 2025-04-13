@@ -18,7 +18,7 @@ import logging
 import math
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import torch
 
@@ -129,12 +129,16 @@ class HiCacheController:
         self,
         mem_pool_device: MHATokenToKVPool,
         mem_pool_host: MLATokenToKVPoolHost,
+        req_to_remove = None,
         write_policy: str = "write_through_selective",
     ):
 
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        self.req_to_remove = req_to_remove
         self.write_policy = write_policy
+
+        self.ongoing_write: Dict[str, int] = {}
 
         if write_policy not in [
             "write_through",
@@ -178,6 +182,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
         self.ack_load_queue.queue.clear()
+        self.ongoing_write.clear()
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_buffer, daemon=True
@@ -288,6 +293,14 @@ class HiCacheController:
             while not self.stop_event.is_set():
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
+                    if self.req_to_remove is not None:
+                        if operation.node_ids[0].rid in self.req_to_remove:
+                            self.ack_write_queue.put(operation.node_ids[0])
+                            continue # skip this operation
+                        if operation.node_ids[0].rid in self.ongoing_write:
+                            self.ongoing_write[operation.node_ids[0].rid] += 1
+                        else:
+                            self.ongoing_write[operation.node_ids[0].rid] = 1
                     factor = (
                         len(operation.device_indices)
                         // self.write_buffer.max_buffer_size
@@ -394,6 +407,10 @@ class HiCacheController:
             self.mem_pool_host.complete_io(operation.host_indices)
             for node_id in operation.node_ids:
                 if node_id != 0:
+                    if self.req_to_remove is not None:
+                        self.ongoing_write[node_id.rid] -= 1
+                        if self.ongoing_write[node_id.rid] == 0:
+                            del self.ongoing_write[node_id.rid]
                     self.ack_write_queue.put(node_id)
         aux_thread.join()
 
@@ -436,3 +453,6 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+
+    def is_writing(self, rid: str) -> bool:
+        return rid in self.ongoing_write and self.ongoing_write[rid] > 0
