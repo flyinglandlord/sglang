@@ -566,6 +566,10 @@ class ScheduleBatch:
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     req_pool_indices: torch.Tensor = None  # shape: [b], int32
     seq_lens: torch.Tensor = None  # shape: [b], int64
+
+    # for selective loading, indicate the length of the input_ids 
+    seq_full_lens: torch.Tensor = None  # shape: [b], int64
+
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int32
     output_ids: torch.Tensor = None  # shape: [b], int32
@@ -1256,6 +1260,7 @@ class ScheduleBatch:
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
+            seq_full_lens=self.seq_full_lens if self.seq_full_lens else self.seq_lens,
             out_cache_loc=self.out_cache_loc,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -1321,6 +1326,8 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
+    # The full sequence length
+    seq_full_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 

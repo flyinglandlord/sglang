@@ -255,7 +255,7 @@ class ForwardBatch:
         # Init position information
         if ret.forward_mode.is_decode():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                ret.positions = clamp_position(batch.seq_full_lens)
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32

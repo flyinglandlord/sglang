@@ -129,11 +129,13 @@ class HiCacheController:
         self,
         mem_pool_device: MHATokenToKVPool,
         mem_pool_host: MLATokenToKVPoolHost,
+        req_to_remove = None,
         write_policy: str = "write_through_selective",
     ):
 
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        self.req_to_remove = req_to_remove
         self.write_policy = write_policy
 
         if write_policy not in [
@@ -288,6 +290,9 @@ class HiCacheController:
             while not self.stop_event.is_set():
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
+                    if self.req_to_remove and operation.node_ids[0] in self.req_to_remove:
+                        self.ack_write_queue.put(operation.node_ids[0])
+                        continue # skip this operation
                     factor = (
                         len(operation.device_indices)
                         // self.write_buffer.max_buffer_size

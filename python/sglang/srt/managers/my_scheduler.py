@@ -57,10 +57,11 @@ class MyScheduler(Scheduler):
         #     req_to_token_pool=self.req_to_token_pool,
         #     token_to_kv_pool=self.token_to_kv_pool,
         # )
-        self.sync_cache = SyncChunkCache(
+        self.tree_cache = SyncChunkCache(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
         )
+        self.kv_selector = self.tree_cache.init_kv_selector()
     
     @torch.no_grad()
     def event_loop_normal(self):
@@ -71,6 +72,8 @@ class MyScheduler(Scheduler):
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
+            if self.kv_selector:
+                self.kv_selector.query_collector.reset()
 
             self.cur_batch = batch
 
@@ -185,7 +188,7 @@ class MyScheduler(Scheduler):
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
-                self.sync_cache.cache_unfinished_req(self.being_chunked_req)
+                self.tree_cache.cache_unfinished_req(self.being_chunked_req)
                 # being chunked request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
@@ -201,15 +204,9 @@ class MyScheduler(Scheduler):
                     print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
                 print(self.running_batch.seq_lens, file=open('tmp/debug_log.txt', 'a'))
 
-
         # write all updates to the sync cache
         if self.last_batch:
-            seq_lens_cpu = self.last_batch.seq_lens.cpu()
-            for seq_len, req in zip(seq_lens_cpu, self.last_batch.reqs):
-                if self.last_batch.forward_mode.is_extend():
-                    self.sync_cache.sync_prefill(req, seq_len)
-                else:
-                    self.sync_cache.sync_decode(req, seq_len)
+            self.tree_cache.sync_batch(self.last_batch)
 
         if self.running_batch is not None:
             self.running_batch.filter_batch()
@@ -218,9 +215,9 @@ class MyScheduler(Scheduler):
         if len(self.loading_queue) != 0:
             loaded_req_list = []
             for req in self.loading_queue:
-                if self.sync_cache.load_check(req):
+                if self.tree_cache.load_check(req):
                     loaded_req_list.append(req)
-            print(self.sync_cache.req_write_op_count.values())
+            # print(self.sync_cache.req_write_op_count.values())
             self.loading_queue = [x for x in self.loading_queue if x not in set(loaded_req_list)]
             if self.debug_log:
                 for req in loaded_req_list:
@@ -231,7 +228,7 @@ class MyScheduler(Scheduler):
                     loaded_req_list,
                     self.req_to_token_pool,
                     self.token_to_kv_pool,
-                    self.sync_cache,
+                    self.tree_cache,
                     self.model_config,
                     self.enable_overlap,
                     self.spec_algorithm,
@@ -359,25 +356,25 @@ class MyScheduler(Scheduler):
                 for i, req in enumerate(self.running_batch.reqs):
                     # req.init_next_round_input(None)
                     if req not in keep_decode_list:
-                        if isinstance(self.sync_cache, SyncChunkCache):
+                        if isinstance(self.tree_cache, SyncChunkCache):
                             if self.debug_log: print(f"evict {req.rid} from device, length {seq_lens_cpu[i]}", file=open('tmp/mem_log.log', 'a+'))
                             try:
-                                self.sync_cache.wait_write(req)
-                                self.sync_cache.evict_device(req, seq_lens_cpu[i])
+                                self.tree_cache.wait_write(req)
+                                self.tree_cache.evict_device(req, seq_lens_cpu[i])
                             except Exception as e:
                                 for req in self.running_batch.reqs:
                                     print(f'{req}')
                                 print(seq_lens_cpu)
                                 raise e
-                        elif isinstance(self.sync_cache, ChunkCache):
+                        elif isinstance(self.tree_cache, ChunkCache):
                             # ChunkCache directly evict all tokens
                             token_indices = self.req_to_token_pool.req_to_token[
                                 req.req_pool_idx, : seq_lens_cpu[i]
                             ]
                             self.token_to_kv_pool.free(token_indices)
                             self.req_to_token_pool.free(req.req_pool_idx)
-                            if req.rid in self.sync_cache.entries:
-                                del self.sync_cache.entries[req.rid]
+                            if req.rid in self.tree_cache.entries:
+                                del self.tree_cache.entries[req.rid]
                             req.reset_for_retract()
                         else:
                             assert False, "Only ChunkCache and SyncChunkCache supports new scheduler"
@@ -429,8 +426,8 @@ class MyScheduler(Scheduler):
                 # if request has been backup in cpu memory, just load it back
                 can_load_reqs_in_prefill_list = []
                 for req in new_prefill_list:
-                    if self.sync_cache.can_load_back(req):
-                        self.sync_cache.load_back(req)
+                    if self.tree_cache.can_load_back(req):
+                        self.tree_cache.load_back(req)
                         # print(f'{req.rid} can load back, kv pool size: {self.token_to_kv_pool.available_size()}')
                         # new_prefill_list.remove(req)
                         can_load_reqs_in_prefill_list.append(req)
@@ -439,9 +436,9 @@ class MyScheduler(Scheduler):
                 new_prefill_list = [x for x in new_prefill_list if x not in set(can_load_reqs_in_prefill_list)]
                 for req in new_prefill_list:
                     # print(f'{req.rid} trigger recompute/prefill, kv pool size: {self.token_to_kv_pool.available_size()}, extend input len: {req.extend_input_len}')
-                    if req.rid in self.sync_cache.entries:
+                    if req.rid in self.tree_cache.entries:
                         req.reset_for_retract()
-                        self.sync_cache.remove_req(req.rid)
+                        self.tree_cache.remove_req(req.rid)
                         print(f'{req.rid} remove from sync cache')
                     # req.init_next_round_input(None)
                 # else, we have to do recompute
@@ -449,7 +446,7 @@ class MyScheduler(Scheduler):
                     new_prefill_list,
                     self.req_to_token_pool,
                     self.token_to_kv_pool,
-                    self.sync_cache,
+                    self.tree_cache,
                     self.model_config,
                     self.enable_overlap,
                     self.spec_algorithm,
@@ -465,7 +462,7 @@ class MyScheduler(Scheduler):
                             if torch.isin(self.req_to_token_pool.req_to_token[ret.reqs[i].req_pool_idx, :ret.seq_lens[i]], 
                             self.req_to_token_pool.req_to_token[ret.reqs[j].req_pool_idx, :ret.seq_lens[j]].clone() 
                             .to(self.req_to_token_pool.req_to_token.device)).any():
-                                print(self.sync_cache.entries.keys())
+                                print(self.tree_cache.entries.keys())
                                 assert False, f"two prefill request {ret.reqs[i].rid} and {ret.reqs[j].rid} share the same token slots"
 
                     # check ret.output_loc is available
@@ -546,7 +543,7 @@ class MyScheduler(Scheduler):
             print('----------------------', file=open('tmp/debug_log.txt', 'a'))
             for req in ret.reqs:
                 print(f'{req}', file=open('tmp/debug_log.txt', 'a'))
-            print(f'{self.sync_cache.entries.keys()}', file=open('tmp/debug_log.txt', 'a'))
+            print(f'{self.tree_cache.entries.keys()}', file=open('tmp/debug_log.txt', 'a'))
             print(f'{ret.seq_lens}', file=open('tmp/debug_log.txt', 'a'))
             if self.running_batch is not None and ret != self.running_batch:
                 print(f'Running batch: ', file=open('tmp/debug_log.txt', 'a'))

@@ -16,7 +16,9 @@
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
+from sglang.srt.selective_loading.query_collector import (
+    QueryCollector, ENABLE_QUERY_COLLECTOR
+)
 
 class RadixAttention(nn.Module):
     """
@@ -49,6 +51,8 @@ class RadixAttention(nn.Module):
         self.is_cross_attention = is_cross_attention
         self.k_scale = None
         self.v_scale = None
+        if ENABLE_QUERY_COLLECTOR:
+            self.query_collector = QueryCollector()
 
     def forward(
         self,
@@ -63,7 +67,8 @@ class RadixAttention(nn.Module):
             assert v is not None
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-
+        if ENABLE_QUERY_COLLECTOR:
+            self.query_collector.add_query(q)
         return forward_batch.attn_backend.forward(
             q, k, v, self, forward_batch, save_kv_cache
         )
