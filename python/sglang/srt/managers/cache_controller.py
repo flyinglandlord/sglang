@@ -290,7 +290,7 @@ class HiCacheController:
             while not self.stop_event.is_set():
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
-                    if self.req_to_remove and operation.node_ids[0] in self.req_to_remove:
+                    if self.req_to_remove and operation.node_ids[0].rid in self.req_to_remove:
                         self.ack_write_queue.put(operation.node_ids[0])
                         continue # skip this operation
                     factor = (

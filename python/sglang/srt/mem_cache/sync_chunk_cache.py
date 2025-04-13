@@ -84,7 +84,7 @@ class SyncChunkCache(ChunkCache):
                 self.token_to_kv_pool_host.free(entry.host_value)
                 entry.host_value = None
                 entry.host_req_pool_idx = None
-        if req.rid in self.req_write_op_count:
+        if self.req_write_op_count[req.rid] == 0:
             del self.req_write_op_count[req.rid]
         if self.kv_selector:
             self.kv_selector.req_finished(req.rid)
@@ -191,26 +191,28 @@ class SyncChunkCache(ChunkCache):
         while not self.stop_event.is_set():
             try:
                 ack = self.cache_controller.ack_write_queue.get(timeout=1)
-                entry = self.entries[ack.rid]
-                if entry is None:
-                    raise RuntimeError(f"Failed to find rid {ack.rid} in entry")
-                if self.kv_selector:
-                    k_cache = self.token_to_kv_pool_host.get_flat_data(
-                        entry.host_value
-                    )[0]
-                    self.kv_selector.post_key_cache(ack.rid, k_cache)
                 with self.entries_lock:
+                    entry = self.entries.get(ack.rid)
+                    if entry:
+                        if ack.rid in self.req_to_remove:
+                            # safe to remove the request from cache, but keep the record
+                            # to let cache controller know the request is finished
+                            token_ids = self.req_to_remove[ack.rid]
+                            self._cache_finished_req(ack.req, token_ids)
+                        elif self.kv_selector:
+                            k_cache = self.token_to_kv_pool_host.get_flat_data(
+                                entry.host_value
+                            )[0]
+                            self.kv_selector.post_key_cache(ack.rid, k_cache)
                     self.req_write_op_count[ack.rid] -= 1
                     if self.req_write_op_count[ack.rid] == 0:
-                        # remove the request from cache
                         if ack.rid in self.req_to_evict:
                             seq_len = self.req_to_evict[ack.rid]
                             del self.req_to_evict[ack.rid]
                             self._evict_device(ack.req, seq_len)
                         elif ack.rid in self.req_to_remove:
-                            token_ids = self.req_to_remove[ack.rid]
                             del self.req_to_remove[ack.rid]
-                            self._cache_finished_req(ack.req, token_ids)
+                            del self.req_write_op_count[ack.rid]
             except Empty:
                 continue
             except Exception as e:
