@@ -50,7 +50,7 @@ class MyScheduler(Scheduler):
         self.reschedule_interval = 1.0
 
         self.runtime_check = False
-        self.debug_log = False
+        self.debug_log = True
 
         # We force the scheduler to use CPU-GPU Radix Cache
         # self.tree_cache = ChunkCache(
@@ -362,9 +362,9 @@ class MyScheduler(Scheduler):
                                 self.tree_cache.wait_write(req)
                                 self.tree_cache.evict_device(req, seq_lens_cpu[i])
                             except Exception as e:
-                                for req in self.running_batch.reqs:
-                                    print(f'{req}')
-                                print(seq_lens_cpu)
+                                # for req in self.running_batch.reqs:
+                                #     print(f'{req}')
+                                # print(seq_lens_cpu)
                                 raise e
                         elif isinstance(self.tree_cache, ChunkCache):
                             # ChunkCache directly evict all tokens

@@ -65,7 +65,7 @@ class SyncChunkCache(ChunkCache):
         if self.poller.is_alive():
             self.poller.join(timeout=2)
         self.stop_event.clear()
-        if self.kv_selector:
+        if self.kv_selector is not None:
             self.kv_selector.reset()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
@@ -86,7 +86,7 @@ class SyncChunkCache(ChunkCache):
                 entry.host_req_pool_idx = None
         if self.req_write_op_count[req.rid] == 0:
             del self.req_write_op_count[req.rid]
-        if self.kv_selector:
+        if self.kv_selector is not None:
             self.kv_selector.req_finished(req.rid)
         # then call base class to free device memory
         super().cache_finished_req(req, token_ids)
@@ -132,8 +132,6 @@ class SyncChunkCache(ChunkCache):
             req.req_pool_idx, : seq_len
         ]
         entry = self.entries[req.rid]
-        if not self.token_to_kv_pool_host.is_synced(entry.host_value):
-            raise RuntimeError(f"Request {req.rid} is not synced")
         self.token_to_kv_pool_host.update_backup(entry.host_value)
         # print('device indices: ', device_indices.detach().cpu().numpy())
         # print('Available device pool size after evict: ', self.token_to_kv_pool.available_size())
@@ -157,8 +155,6 @@ class SyncChunkCache(ChunkCache):
             raise RuntimeError(f"Request {rid} is loading")
         if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
             raise RuntimeError(f"Request {rid} is writing")
-        if self.token_to_kv_pool_host.get_state(entry.host_value) != MemoryStateInt.BACKUP:
-            raise RuntimeError(f"Request {rid} is not in host memory")
         # allocate device memory
         device_indices = self.cache_controller.load(
             entry.host_value, node_id=entry
@@ -193,12 +189,11 @@ class SyncChunkCache(ChunkCache):
                 ack = self.cache_controller.ack_write_queue.get(timeout=1)
                 with self.entries_lock:
                     entry = self.entries.get(ack.rid)
-                    if entry:
+                    if entry is not None:
                         if ack.rid in self.req_to_remove:
-                            # safe to remove the request from cache, but keep the record
-                            # to let cache controller know the request is finished
-                            token_ids = self.req_to_remove[ack.rid]
-                            self._cache_finished_req(ack.req, token_ids)
+                            if not self.cache_controller.is_writing(ack.rid):
+                                token_ids = self.req_to_remove[ack.rid]
+                                self._cache_finished_req(ack.req, token_ids)
                         elif self.kv_selector:
                             k_cache = self.token_to_kv_pool_host.get_flat_data(
                                 entry.host_value
@@ -233,11 +228,12 @@ class SyncChunkCache(ChunkCache):
             raise RuntimeError(f"Request {req.rid} not in cache")
         if req.rid not in self.req_write_op_count:
             raise RuntimeError(f"Request {req.rid} not in write op count")
-        retry = 0
+        start_time = time.time()
         while self.req_write_op_count[req.rid] > 0:
             time.sleep(1e-4)
-            retry += 1
-        # assert retry < 100000, f"Wait write op for {req.rid} timeout, count: {self.req_write_op_count}"
+            if time.time() - start_time > 5:
+                print(self.req_write_op_count)
+                raise RuntimeError(f"Request {req.rid} write op timeout")
 
     def sync_decode(self, req: Req, seq_len: int):
         # add a write operation for this one token generated in this step
@@ -289,7 +285,7 @@ class SyncChunkCache(ChunkCache):
 
     def sync_batch(self, batch: ScheduleBatch):
         seq_lens_cpu = batch.seq_lens.cpu()
-        if self.kv_selector:
+        if self.kv_selector is not None:
             self.kv_selector.update_with_batch(batch)
         with self.entries_lock:
             for i, req in enumerate(batch.reqs):
