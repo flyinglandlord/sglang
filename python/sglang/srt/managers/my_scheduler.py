@@ -155,6 +155,9 @@ class MyRequestOffloadManager():
         #assert req not in self.evict_queue, "Double adding the evicting request"
         self.evict_queue.append((req, evict_len, time.time()))
 
+    def get_total_reqs(self):
+        return len(self.load_queue) + len(self.loading_queue) + len(self.evict_queue)
+
     def get_and_remove_finished_load(self):
         loaded_req = []
         for req in self.loading_queue:
@@ -162,7 +165,10 @@ class MyRequestOffloadManager():
                 loaded_req.append(req)
         for req in loaded_req:
             self.loading_queue.remove(req)
-        return loaded_req
+        res = []
+        for req in loaded_req:
+            res.append(req[0])
+        return res
 
     def is_all_evict_finished(self):
         return len(self.sync_cache.get_evicting_reqs()) == 0
@@ -177,7 +183,18 @@ class MyRequestOffloadManager():
         return self.evict_queue
     
     def get_ongoing_load(self):
+        return self.loading_queue
+    
+    def get_waiting_load(self):
         return self.load_queue
+
+    def get_all_load_erqs(self):
+        res = []
+        for req in self.load_queue:
+            res.append(req[0])
+        for req in self.loading_queue:
+            res.append(req[0])
+        return res
 
     def step(self):
         if len(self.load_queue) > 0 or len(self.evict_queue) > 0:
@@ -205,7 +222,7 @@ class MyRequestOffloadManager():
                     # assert self.sync_cache.can_load_back(req[0]), "A request cannot loadback in the Offload Manager"
                     self.sync_cache.load_back(req[0])
                     filtered_in_load_queue.append(req)
-            for req in filtered_in_evict_queue:
+            for req in filtered_in_load_queue:
                 self.load_queue.remove(req)
                 self.loading_queue.append(req)
         return finished_evict
@@ -470,12 +487,15 @@ class MyScheduler(Scheduler):
 
         schedule_decision = MyScheduleDecision(self.token_to_kv_pool, self.cum_buffer_size, self.output_speed,
                                             [] if self.running_batch is None else self.running_batch.reqs, 
-                                            self.waiting_queue, self.offload_manager.get_ongoing_load(),
+                                            self.waiting_queue, self.offload_manager.get_all_load_erqs(),
                                             self.max_running_requests, self.max_prefill_tokens, self.new_token_ratio)
 
         self.initial_greedy_selection(schedule_decision, valid_thr)
         # self.local_search(schedule_decision, valid_thr)
-        print(schedule_decision.keep_running_list, schedule_decision.new_load_list, schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
+        print('keep_running_list', schedule_decision.keep_running_list, file=open('tmp/schedule_output.txt', "a"))
+        print('new_load_list', schedule_decision.new_load_list, file=open('tmp/schedule_output.txt', "a"))
+        print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
+        print('--------------------------------', file=open('tmp/schedule_output.txt', "a"))
         return schedule_decision
             
     def get_next_batch_to_run(self):
@@ -512,7 +532,6 @@ class MyScheduler(Scheduler):
         # update_offload_manager()
         self.waiting_queue.extend(self.offload_manager.step())
         loaded_req_list = self.offload_manager.get_and_remove_finished_load()
-        self.loading_queue = self.offload_manager.get_ongoing_load()
         if len(loaded_req_list) != 0:
             loaded_batch = ScheduleBatch.init_new(
                 loaded_req_list,
@@ -543,9 +562,9 @@ class MyScheduler(Scheduler):
                 return ret
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
-                before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + len(self.offload_manager.load_queue)
+                before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
             else:
-                before_req_nums = len(self.waiting_queue) + len(self.offload_manager.load_queue)
+                before_req_nums = len(self.waiting_queue) + self.offload_manager.get_total_reqs()
             self.last_schedule = time.time()
             
             self.schedule_decision = self.generate_schedule_decision()
@@ -562,7 +581,6 @@ class MyScheduler(Scheduler):
                     if req not in self.schedule_decision.keep_running_list:
                         evict_list.append(req)
                 
-                print(f"evict list: {evict_list}")
                 # second we deal with the evict process
                 for i, req in enumerate(evict_list):
                     idx = self.running_batch.reqs.index(req)
@@ -653,7 +671,7 @@ class MyScheduler(Scheduler):
                 current_req_nums = len(self.schedule_decision.new_prefill_list) + \
                     ((len(self.running_batch.reqs)) if (self.running_batch is not None) else 0) + \
                     ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0) + \
-                    ((len(self.loading_queue)) if (self.loading_queue is not None) else 0)
+                    self.offload_manager.get_total_reqs()
                 try:
                     assert current_req_nums == before_req_nums, \
                         f"request number not match ({current_req_nums} {before_req_nums})"
@@ -665,7 +683,7 @@ class MyScheduler(Scheduler):
                 current_req_nums = \
                     ((len(self.running_batch.reqs)) if (self.running_batch is not None) else 0) + \
                     ((len(self.waiting_queue)) if (self.waiting_queue is not None) else 0) + \
-                    ((len(self.loading_queue)) if (self.loading_queue is not None) else 0)
+                    self.offload_manager.get_total_reqs()
                 try:
                     assert current_req_nums == before_req_nums, \
                         f"request number not match ({current_req_nums} {before_req_nums})"

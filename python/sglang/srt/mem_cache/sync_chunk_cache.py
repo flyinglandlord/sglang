@@ -125,7 +125,7 @@ class SyncChunkCache(ChunkCache):
             raise RuntimeError(f"Request {req.rid} not in cache")
         if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 0:
             raise RuntimeError(f"Request {req.rid} is writing")
-        if req.last_node.loading:
+        if req.last_node is not None and req.last_node.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
         # evict the device memory
         device_indices = self.req_to_token_pool.req_to_token[
