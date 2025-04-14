@@ -146,7 +146,7 @@ class SyncChunkCache(ChunkCache):
         rid = req.rid
         if rid not in self.entries:
             raise RuntimeError(f"Request {rid} not in cache")
-        entry = self.entries[rid]
+        entry: ChunkCacheEntry = self.entries[rid]
         if not entry.backuped:
             raise RuntimeError(f"Request {rid} not backuped")
         if entry.host_value is None:
@@ -235,12 +235,14 @@ class SyncChunkCache(ChunkCache):
                 print(self.req_write_op_count)
                 raise RuntimeError(f"Request {req.rid} write op timeout")
 
-    def sync_decode(self, req: Req, seq_len: int):
+    def _sync_decode(self, req: Req, seq_len: int, is_recompute: bool = False):
         # add a write operation for this one token generated in this step
         if req.rid not in self.entries:
             # print(f"WARNING: Request {req.rid} not in cache")
             return # scheduler will remove request before the my_scheduler call this
         entry: ChunkCacheEntry = self.entries[req.rid]
+        if is_recompute and not entry.evicted:
+            raise RuntimeError(f"Request {req.rid} not evicted, recompute is not allowed")
         if entry.host_value is None:
             raise RuntimeError(f"Host value is None for rid {req.rid}")
         host_indices = self.token_to_kv_pool_host.alloc(1)
@@ -249,21 +251,22 @@ class SyncChunkCache(ChunkCache):
         # original cache_controller.write writes the whole request
         # so we need to modify it to write only the last token
         device_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, seq_len - 1: seq_len
+            req.req_pool_idx, : seq_len
         ]
         self.token_to_kv_pool_host.protect_write(host_indices)
         self.cache_controller.write_queue.put(
-            CacheOperation(host_indices, device_indices, entry)
+            CacheOperation(host_indices, device_indices[-1:], entry)
         )
         entry.host_value = torch.cat([entry.host_value, host_indices], dim=0)
-        entry.value = torch.cat([entry.value, device_indices], dim=0)
+        entry.value = device_indices
         entry.backuped = True
         self.req_write_op_count[req.rid] += 1
     
-    def sync_prefill(self, req: Req, seq_len: int):
+    def _sync_prefill(self, req: Req, seq_len: int):
         # add a write operation for this one token generated in this step
         if req.rid in self.entries:
-            raise RuntimeError(f"Request {req.rid} already in cache")
+            # recomputing a request is the same as decoding
+            return self._sync_decode(req, seq_len, True)
         if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 0:
             raise RuntimeError(f"Request {req.rid} already in write op count")
         device_indices = self.req_to_token_pool.req_to_token[
@@ -290,6 +293,6 @@ class SyncChunkCache(ChunkCache):
         with self.entries_lock:
             for i, req in enumerate(batch.reqs):
                 if batch.forward_mode.is_extend():
-                    self.sync_prefill(req, seq_lens_cpu[i])
+                    self._sync_prefill(req, seq_lens_cpu[i])
                 else:
-                    self.sync_decode(req, seq_lens_cpu[i])
+                    self._sync_decode(req, seq_lens_cpu[i])

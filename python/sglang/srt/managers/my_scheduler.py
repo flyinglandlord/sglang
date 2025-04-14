@@ -66,16 +66,23 @@ class MyScheduleDecision():
         self.new_token_ratio = new_token_ratio
 
         # self.initialize_keep_running_list()
+    
+    def estimate_req_kv_budget(self, req):
+        min_generated_num = 32
+        return (
+            len(req.origin_input_ids) + len(req.output_ids) + 
+            max(self.output_speed[req.rid] - self.cum_buffer[req.rid], min_generated_num)
+        )
 
     def initialize_keep_running_list(self):
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
         for req in self.running_reqs:
-            if self.avail_running_requests > 0 and \
-            self.avail_tokens >= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0):
+            kv_budget = self.estimate_req_kv_budget(req)
+            if self.avail_running_requests > 0 and self.avail_tokens >= kv_budget:
                 self.keep_running_list.append(req)
                 self.avail_running_requests -= 1
-                self.avail_tokens -= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0)
+                self.avail_tokens -= kv_budget
 
     def remove_request(self, req):
         if req not in self.keep_running_list and req not in self.new_load_list and req not in self.new_prefill_list:
@@ -90,7 +97,7 @@ class MyScheduleDecision():
             self.new_load_list.remove(req)
         
         self.avail_running_requests += 1
-        self.avail_tokens += len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0)
+        self.avail_tokens += self.estimate_req_kv_budget(req)
     
     def can_add_request(self, req, recompute=False):
         if req in self.keep_running_list or req in self.new_load_list or req in self.new_prefill_list:
@@ -99,16 +106,14 @@ class MyScheduleDecision():
         if req in self.loading_reqs:
             return False
         elif req in self.waiting_reqs:
-            if self.avail_running_requests > 0 and \
-            self.avail_tokens >= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0):
+            if self.avail_running_requests > 0 and self.avail_tokens >= self.estimate_req_kv_budget(req):
                 if recompute and self.avail_prefill_tokens >= len(req.origin_input_ids) + len(req.output_ids):
                     return True
                 elif not recompute:
                     return True
                 return False
         else:
-            if self.avail_running_requests > 0 and \
-            self.avail_tokens >= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0):
+            if self.avail_running_requests > 0 and self.avail_tokens >= self.estimate_req_kv_budget(req):
                 return True
             return False
 
@@ -116,25 +121,23 @@ class MyScheduleDecision():
         # 为外部的其余调度逻辑添加的接口
         if req in self.keep_running_list or req in self.new_load_list or req in self.new_prefill_list:
             assert False, "Duplicate add request"
-
+        kv_budget = self.estimate_req_kv_budget(req)
         if req in self.loading_reqs:
             assert False, "Cannot add a request already in loading state"
         elif req in self.waiting_reqs:
-            if self.avail_running_requests > 0 and \
-            self.avail_tokens >= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0):
+            if self.avail_running_requests > 0 and self.avail_tokens >= kv_budget:
                 if recompute and self.avail_prefill_tokens >= len(req.origin_input_ids) + len(req.output_ids):
                     self.new_prefill_list.append(req)
                     self.avail_prefill_tokens -= len(req.origin_input_ids) + len(req.output_ids)
                 elif not recompute:
                     self.new_load_list.append(req)
                 self.avail_running_requests -= 1
-                self.avail_tokens -= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0)
+                self.avail_tokens -= kv_budget
         else:
-            if self.avail_running_requests > 0 and \
-            self.avail_tokens >= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0):
+            if self.avail_running_requests > 0 and self.avail_tokens >= kv_budget:
                 self.keep_running_list.append(req)
                 self.avail_running_requests -= 1
-                self.avail_tokens -= len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer[req.rid], 0)
+                self.avail_tokens -= kv_budget
 
 class MyRequestOffloadManager():
     def __init__(self, sync_cache):
@@ -177,7 +180,8 @@ class MyRequestOffloadManager():
         return self.load_queue
 
     def step(self):
-        print(self.load_queue, self.evict_queue)
+        if len(self.load_queue) > 0 or len(self.evict_queue) > 0:
+            print(self.load_queue, self.evict_queue)
         # NOTE: Later we can adopt more fine-grained offload strategy
         # First we deal with the evict request, only request are finished we can only do loading
         finished_evict = []
@@ -218,6 +222,7 @@ class MyScheduler(Scheduler):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
         )
+        self.kv_selector = self.tree_cache.init_kv_selector()
 
         # Some record
         self.decode_time_stamp = {}
@@ -254,7 +259,7 @@ class MyScheduler(Scheduler):
             st = time.time()
 
             batch = self.get_next_batch_to_run()
-            if self.kv_selector:
+            if self.kv_selector is not None:
                 self.kv_selector.query_collector.reset()
 
             self.cur_batch = batch
@@ -498,12 +503,8 @@ class MyScheduler(Scheduler):
 
         # update_sync_cache()
         if self.last_batch and isinstance(self.tree_cache, SyncChunkCache):
-            seq_lens_cpu = self.last_batch.seq_lens.cpu()
-            for seq_len, req in zip(seq_lens_cpu, self.last_batch.reqs):
-                if self.last_batch.forward_mode.is_extend():
-                    self.tree_cache.sync_prefill(req, seq_len)
-                else:
-                    self.tree_cache.sync_decode(req, seq_len)
+            self.tree_cache.sync_batch(self.last_batch)
+    
         # update_batch()
         if self.running_batch is not None:
             self.running_batch.filter_batch()
@@ -620,7 +621,7 @@ class MyScheduler(Scheduler):
                 for req in self.schedule_decision.new_prefill_list:
                     if req.rid in self.tree_cache.entries:
                         req.reset_for_retract()
-                        self.tree_cache.remove_req(req)
+                        # self.tree_cache.remove_req(req)
                     req.init_next_round_input(None)
                 
                 # else, we have to do recompute
