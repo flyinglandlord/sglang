@@ -248,6 +248,10 @@ class SyncChunkCache(ChunkCache):
         host_indices = self.token_to_kv_pool_host.alloc(1)
         if host_indices is None:
             raise RuntimeError("Failed to allocate host memory for backup")
+        assert seq_len == entry.host_value.shape[0] + 1, \
+            f"seq_len {seq_len} != host_indices {entry.host_value.shape[0]} + 1"
+        if is_recompute: # directly mark the backup host memory as synced
+            self.token_to_kv_pool_host.update_synced(entry.host_value)
         # original cache_controller.write writes the whole request
         # so we need to modify it to write only the last token
         device_indices = self.req_to_token_pool.req_to_token[
