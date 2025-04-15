@@ -79,15 +79,15 @@ class SyncChunkCache(ChunkCache):
     def _cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         # free host memory
         if req.rid in self.entries:
-            entry = self.entries[req.rid]
+            entry: ChunkCacheEntry = self.entries[req.rid]
             if entry.host_value is not None:
                 self.token_to_kv_pool_host.free(entry.host_value)
                 entry.host_value = None
                 entry.host_req_pool_idx = None
-        if self.req_write_op_count[req.rid] == 0:
-            del self.req_write_op_count[req.rid]
-        if self.kv_selector is not None:
-            self.kv_selector.req_finished(req.rid)
+            if self.req_write_op_count[req.rid] == 0:
+                del self.req_write_op_count[req.rid]
+        else: 
+            print(f"WARNING: Request {req.rid} finished right after prefill")
         # then call base class to free device memory
         super().cache_finished_req(req, token_ids)
 
@@ -102,10 +102,11 @@ class SyncChunkCache(ChunkCache):
         # since we write kv cache to cpu memory in a separate thread.
         # The cache will finally be remove when polling the write ack queue.
         with self.entries_lock:
-            if self.req_write_op_count.get(req.rid, 0) > 0:
-                self.req_to_remove[req.rid] = token_ids
-            else: # remove the request immediately
+            if self.req_write_op_count.get(req.rid, 0) == 0:
                 self._cache_finished_req(req, token_ids)
+            self.req_to_remove[req.rid] = token_ids
+        if self.kv_selector is not None:
+            self.kv_selector.req_finished(req.rid)
 
     def evict_device(self, req: Req, seq_len: int):
         # NOTE: Also asynchronized way to evict device memory
@@ -156,9 +157,7 @@ class SyncChunkCache(ChunkCache):
         if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
             raise RuntimeError(f"Request {rid} is writing")
         # allocate device memory
-        device_indices = self.cache_controller.load(
-            entry.host_value, node_id=entry
-        )
+        device_indices = self.cache_controller.load(entry.host_value, node_id=entry)
         if device_indices is None:
             raise RuntimeError(f'Failed to allocate device memory for request {rid}')
         # update the entry
@@ -188,13 +187,13 @@ class SyncChunkCache(ChunkCache):
             try:
                 ack = self.cache_controller.ack_write_queue.get(timeout=1)
                 with self.entries_lock:
-                    entry = self.entries.get(ack.rid)
+                    entry: ChunkCacheEntry = self.entries.get(ack.rid)
                     if entry is not None:
                         if ack.rid in self.req_to_remove:
                             if not self.cache_controller.is_writing(ack.rid):
                                 token_ids = self.req_to_remove[ack.rid]
                                 self._cache_finished_req(ack.req, token_ids)
-                        elif self.kv_selector:
+                        elif self.kv_selector is not None:
                             k_cache = self.token_to_kv_pool_host.get_flat_data(
                                 entry.host_value
                             )[0]
@@ -217,7 +216,7 @@ class SyncChunkCache(ChunkCache):
         # check if the request can be loaded back
         if req.rid not in self.entries:
             return False
-        entry = self.entries[req.rid]
+        entry: ChunkCacheEntry = self.entries[req.rid]
         if entry.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
         return entry.host_value is not None
@@ -293,9 +292,16 @@ class SyncChunkCache(ChunkCache):
     def sync_batch(self, batch: ScheduleBatch):
         seq_lens_cpu = batch.seq_lens.cpu()
         if self.kv_selector is not None:
-            self.kv_selector.update_with_batch(batch)
+            self.kv_selector.update_with_batch(batch, self.req_to_remove)
         with self.entries_lock:
             for i, req in enumerate(batch.reqs):
+                if req.rid in self.req_to_remove:
+                    op_count = self.req_write_op_count.get(req.rid)
+                    if op_count is None or op_count == 0:
+                        del self.req_to_remove[req.rid]
+                        if op_count is not None:
+                            del self.req_write_op_count[req.rid]
+                    continue
                 if batch.forward_mode.is_extend():
                     self._sync_prefill(req, seq_lens_cpu[i])
                 else:
