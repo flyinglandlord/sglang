@@ -7,7 +7,7 @@ rm /mtc/chenjunyi/sglang/tmp/output_speed_info.log
 rm /mtc/chenjunyi/sglang/tmp/schedule_output.txt
 
 /mtc/yongyang/miniconda/envs/sgl_test/bin/python -m sglang.bench_serving  \
-    --port 8888 \
+    --port 8000 \
     --backend sglang \
     --num-prompts 90 \
     --dataset-name random \

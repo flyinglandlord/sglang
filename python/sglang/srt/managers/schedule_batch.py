@@ -535,7 +535,7 @@ class Req:
     def __repr__(self):
         return (
             f"rid(n={self.rid}, "
-            f"input_ids={len(self.origin_input_ids)}, output_ids={self.output_ids}, prefix_indices={len(self.prefix_indices)})"
+            f"input_ids={len(self.origin_input_ids)}, output_ids={len(self.output_ids)}, prefix_indices={len(self.prefix_indices)})"
         )
 
 
