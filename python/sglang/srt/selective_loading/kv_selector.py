@@ -9,7 +9,7 @@ from queue import Empty, Full, Queue
 from einops import rearrange, einsum
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.selective_loading.query_collector import QueryCollector
+from sglang.srt.selective_loading.query_collector import QueryCollector, SAMPLED_LAYERS
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,9 @@ class KVSelectEntry:
         self.rid = rid
         self.input_ids = deepcopy(input_ids)
         self.output_ids = deepcopy(output_ids)
+        self.accumu_length: int = 0
+        self.last_compute_time: float = 0.0
+        self.total_compute_time: float = 0.0
         # NOTE: `last_length` is the length of the request last seen by this entry
         # it is used to update output_ids when new tokens are generated.
         # Also, when the request undergoes a kv selection, the `last_length`
@@ -64,7 +67,7 @@ class KVSelector:
         self.worker.start()
         self.head_num = head_num
         self.head_dim = head_dim
-        self.layer_num = layer_num
+        self.layer_num = len(SAMPLED_LAYERS)
         print(f"KVSelector: head_num {head_num}, head_dim {head_dim}, layer_num {layer_num}")
     
     def reset(self):
@@ -114,16 +117,19 @@ class KVSelector:
                 self.cached_queries[req.rid].put(query.transpose(0, 1))
 
     def post_key_cache(self, rid: str, key: torch.Tensor) -> None:
-        print(f"KVSelector: post key cache for request {rid}, key shape {key.shape}")
-        if rid not in self.cached_queries:
-            logger.warning(f"Request {rid} not found in cached queries, ignoring posted key cache")
+        if rid not in self.cached_queries or rid not in self.entries:
+            logger.warning(f"Request {rid} not found in kv selector, ignoring posted key cache")
             return
         try:
             query = self.cached_queries[rid].get_nowait()
         except Empty:
             logger.warning(f"Request {rid} has no cached query, ignoring posted key cache")
             return
-        self.op_queue.put(KVSelectOperation(rid, query, key))
+        entry: KVSelectEntry = self.entries[rid]
+        entry.accumu_length += query.shape[1]
+        assert key.shape[1] >= entry.accumu_length, \
+            f"Key shape {key.shape[1]} is less than accumulated length {entry.accumu_length}"
+        self.op_queue.put(KVSelectOperation(rid, query, key[SAMPLED_LAYERS, : entry.accumu_length]))
         self.compute_op_count[rid] = self.compute_op_count.get(rid, 0) + 1
 
     def restore_req(self, req: Req) -> None:
@@ -145,17 +151,12 @@ class KVSelector:
 
     def _worker(self) -> None:
         torch.set_num_threads(NUM_TORCH_SUBPROCESSES)
-        torch.set_num_interop_threads(NUM_TORCH_SUBPROCESSES)
         while not self.stop_event.is_set():
             try:
                 op = self.op_queue.get(timeout=1)
             except Empty:
                 continue
-            if op.rid in self.finished_reqs:
-                logger.warning(f"Request {op.rid} is already finished, skipping KV selection")
-            elif op.rid not in self.entries:
-                logger.warning(f"Request {op.rid} not found in KVSelectEntry, skipping KV selection")
-            else:
+            if op.rid not in self.finished_reqs and op.rid in self.entries:
                 try:
                     self._compute_op(op)
                 except Exception as e:
@@ -175,7 +176,7 @@ class KVSelector:
         query = op.query.view(self.layer_num, op.query.shape[1], -1, self.head_dim)
         query = query.transpose(1, 2) # (layer_num, head_num, seq_length, head_dim)
         key = op.key.transpose(1, 2) # (layer_num, head_num, seq_length, head_dim)
-        print(f"KVSelector: compute op {op.rid} query shape {query.shape}, key shape {key.shape}")
+        # print(f"KVSelector: compute op {op.rid} query shape {query.shape}, key shape {key.shape}")
         time_start = time.time()
         group_query_num = query.shape[1] // key.shape[1]
         query = rearrange(query, "b (h g) l d -> b g h l d", g=group_query_num)
@@ -190,11 +191,14 @@ class KVSelector:
         if entry is None:
             return
         if entry.accumu_attn_scores is None:
-            print(op.rid, "score shape", scores.shape, "accumulated score shape", None)
+            # print(op.rid, "score shape", scores.shape, "accumulated score shape", None)
             entry.accumu_attn_scores = scores
         else:
-            print(op.rid, "score shape", scores.shape, "accumulated score shape", entry.accumu_attn_scores.shape)
+            # print(op.rid, "score shape", scores.shape, "accumulated score shape", entry.accumu_attn_scores.shape)
             scores[:-1] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
         elapsed_time = time.time() - time_start
-        print(f"KVSelectOperation: {op.rid} compute time {elapsed_time:.4f} seconds")
+        entry.total_compute_time += elapsed_time
+        entry.last_compute_time = elapsed_time
+        print(f"KVSelector: compute op {op.rid} time {elapsed_time:.4f}s, "
+              f"accumulated time {entry.total_compute_time:.4f}s")
