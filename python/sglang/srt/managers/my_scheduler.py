@@ -219,6 +219,8 @@ class MyRequestOffloadManager():
         return res
 
     def step(self):
+        if len(self.load_queue) > 0 or len(self.evict_queue) > 0:
+            print(f"load queue: {len(self.load_queue)} evict queue: {len(self.evict_queue)}")
         # NOTE: Later we can adopt more fine-grained offload strategy
         # First we deal with the evict request, only request are finished we can only do loading
         #print(f"1: {len(self.evict_queue)}, {len(self.evicting_queue)}")
@@ -670,15 +672,6 @@ class MyScheduler(Scheduler):
                 self.waiting_queue = [
                     x for x in self.waiting_queue if x not in set(self.schedule_decision.new_prefill_list)
                 ]
-                # check the total token number is valid (not exceed the GPU available size)
-                total_new_token = 0
-                for i in self.schedule_decision.new_prefill_list:
-                    total_new_token += i.extend_input_len
-                try:
-                    assert total_new_token <= self.token_to_kv_pool.available_size(), \
-                        f"new token {total_new_token} exceed the available size {self.token_to_kv_pool.available_size()}"
-                except Exception as e:
-                    raise e
                 
                 for req in self.schedule_decision.new_prefill_list:
                     if req.rid in self.tree_cache.entries:
