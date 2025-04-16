@@ -56,11 +56,13 @@ class MyScheduleDecision():
             # 我们假定loading的新请求至少需要多decode一秒钟的token量
             loading_tokens += len(req.output_ids) + len(req.origin_input_ids) + self.output_speed[req.rid]
         evicting_tokens = 0
+        evicting_reqs = 0
         for req in self.evicting_reqs:
+            evicting_reqs += 1
             evicting_tokens += len(req.output_ids) + len(req.origin_input_ids)
 
         self.max_tokens = token_to_kv_pool.size - loading_tokens - evicting_tokens
-        self.max_running_requests = max_running_requests - loading_reqs
+        self.max_running_requests = max_running_requests - loading_reqs - evicting_reqs - 5
         self.max_prefill_tokens = max_prefill_tokens
 
         self.avail_tokens = self.max_tokens
@@ -72,7 +74,7 @@ class MyScheduleDecision():
         # self.initialize_keep_running_list()
     
     def estimate_req_kv_budget(self, req):
-        min_generated_num = 32
+        min_generated_num = 64
         return (
             len(req.origin_input_ids) + len(req.output_ids) + min_generated_num
         )

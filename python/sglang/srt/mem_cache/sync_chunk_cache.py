@@ -129,14 +129,12 @@ class SyncChunkCache(ChunkCache):
         if req.last_node is not None and req.last_node.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
         # evict the device memory
-        device_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : seq_len
-        ]
-        entry = self.entries[req.rid]
+        entry: ChunkCacheEntry = self.entries[req.rid]
+        assert entry.value is not None, f"Request {req.rid} value is None"
         self.token_to_kv_pool_host.update_backup(entry.host_value)
         # print('device indices: ', device_indices.detach().cpu().numpy())
         # print('Available device pool size after evict: ', self.token_to_kv_pool.available_size())
-        self.token_to_kv_pool.free(device_indices)
+        self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
         entry.evicted = True

@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 
+def synchronized(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -114,11 +123,13 @@ class BaseTokenToKVPool:
         self.free_slots = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.lock = threading.RLock()
         self.clear()
 
     def available_size(self):
         return len(self.free_slots)
 
+    @synchronized
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
             return None
@@ -130,6 +141,7 @@ class BaseTokenToKVPool:
         # torch.set_printoptions(profile="default")
         return select_index.to(self.device, non_blocking=True)
 
+    @synchronized
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -147,15 +159,18 @@ class BaseTokenToKVPool:
         else:
             self.free_group.append(free_index)
 
+    @synchronized
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
 
+    @synchronized
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
             self.free(torch.concat(self.free_group))
 
+    @synchronized
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
@@ -440,15 +455,6 @@ class MemoryStateInt(IntEnum):
     PROTECTED = 2
     SYNCED = 3
     BACKUP = 4
-
-
-def synchronized(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        with self.lock:
-            return func(self, *args, **kwargs)
-
-    return wrapper
 
 
 class MLATokenToKVPoolHost:
