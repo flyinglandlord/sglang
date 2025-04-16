@@ -1107,6 +1107,7 @@ class Scheduler:
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
             test_retract and batch.batch_size() > 10
         ):
+            assert False, f"Decode out of memory happened. {batch.batch_size()=}"
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio = batch.retract_decode()
