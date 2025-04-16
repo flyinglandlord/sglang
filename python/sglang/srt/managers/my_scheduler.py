@@ -385,7 +385,7 @@ class MyScheduler(Scheduler):
                     self.rebuffer_time[rid] += during_time - \
                         self.cum_buffer_size[rid] / self.output_speed[rid]
                     self.cum_buffer_size[rid] = 0
-            # print(self.cum_buffer_size)
+        print(self.cum_buffer_size, file=open('tmp/buffer_size.log', 'a'))
 
     def get_valid_throughput(self):
         # currently we use e^{-x} as the valid throughput
@@ -584,11 +584,37 @@ class MyScheduler(Scheduler):
 
         # update_buffer_size()
         self.update_buffer_size()
-        
+
+        if self.runtime_check and self.running_batch is not None:
+            # print(self.running_batch)
+            for i,req in enumerate(self.running_batch.reqs):
+                # check the running request req_to_token_pool is not available
+                if req.req_pool_idx in self.req_to_token_pool.free_slots:
+                    print(req.req_pool_idx)
+                    assert False, f"why running request {req.rid}'s req_pool_idx {req.req_pool_idx} is available??"
+ 
+                # check running request token slot is released by error
+                if torch.isin(self.token_to_kv_pool.free_slots, 
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]].clone()
+                .to(self.token_to_kv_pool.free_slots.device),).any():
+                    print(self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]])
+                    assert False, \
+                    f"why running request {req.rid}'s token slots is in the free slots list??"
+ 
+            # check if two running request share the token slots
+            for i in range(len(self.running_batch.reqs)):
+                for j in range(i+1, len(self.running_batch.reqs)):
+                    if torch.isin(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]], 
+                    torch.tensor(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]], 
+                                    device=(self.req_to_token_pool.req_to_token.device))).any():
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]])
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]])
+                        print('i', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]]))
+                        print('j', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]]))
+                        assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
+    
         if (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval) and self.offload_manager.is_all_evict_finished():
-            print('here')
             if self.next_prefill_batch is not None:
-                print('delayed prefill now')
                 ret = self.next_prefill_batch
                 self.next_prefill_batch = None
                 ret.prepare_for_extend()
@@ -605,8 +631,6 @@ class MyScheduler(Scheduler):
             
             if len(self.schedule_decision.new_prefill_list) == 0 and len(self.schedule_decision.keep_running_list) == 0 and len(self.schedule_decision.new_load_list) == 0:
                 return None
-            
-            print(len(self.schedule_decision.new_prefill_list), len(self.schedule_decision.new_load_list), len(self.schedule_decision.keep_running_list))
 
             # first we get the evict request list and filter the running batch
             evict_list = []
@@ -659,7 +683,7 @@ class MyScheduler(Scheduler):
                 ]
                 # second we deal with the load process
                 for i, req in enumerate(self.schedule_decision.new_load_list):
-                    print(f"loading {req.rid}")
+                    # print(f"loading {req.rid}")
                     self.offload_manager.add_load_request(req)
                 # print('req_to_token_pool', self.req_to_token_pool.available_size(), '/', self.req_to_token_pool.size)
                 self.waiting_queue.extend(self.offload_manager.step())
@@ -737,7 +761,11 @@ class MyScheduler(Scheduler):
             if self.running_batch is None:
                 ret = None
             else:
-                self.running_batch = self.update_running_batch(self.running_batch)
+                try:
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                except Exception as e:
+                    print(self.running_batch.reqs)
+                    raise e
                 ret = self.running_batch
 
         # Keep the old code

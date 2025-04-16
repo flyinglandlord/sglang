@@ -5,6 +5,7 @@ rm /mtc/chenjunyi/sglang/tmp/mem_log.log
 rm /mtc/chenjunyi/sglang/tmp/offload_log.txt
 rm /mtc/chenjunyi/sglang/tmp/output_speed_info.log
 rm /mtc/chenjunyi/sglang/tmp/schedule_output.txt
+rm /mtc/chenjunyi/sglang/tmp/buffer_size.log
 
 /mtc/yongyang/miniconda/envs/sgl_test/bin/python -m sglang.bench_serving  \
     --port 8000 \

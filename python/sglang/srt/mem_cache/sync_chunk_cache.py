@@ -136,7 +136,14 @@ class SyncChunkCache(ChunkCache):
         self.token_to_kv_pool_host.update_backup(entry.host_value)
         # print('device indices: ', device_indices.detach().cpu().numpy())
         # print('Available device pool size after evict: ', self.token_to_kv_pool.available_size())
-        self.token_to_kv_pool.free(device_indices)
+        try:
+            print(f'{req.rid}', file=open('tmp/mem_log.log', 'a+'))
+            self.token_to_kv_pool.free(device_indices)
+        except Exception as e:
+            print(f'failed at {req.rid}')
+            print(req)
+            print(seq_len)
+            raise e
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
         entry.evicted = True
