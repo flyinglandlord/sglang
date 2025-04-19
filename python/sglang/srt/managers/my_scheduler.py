@@ -48,13 +48,14 @@ class MyScheduleDecision():
         self.waiting_reqs = waiting_reqs
         self.loading_reqs = loading_reqs
         self.evicting_reqs = evicting_reqs
+        # 我们假定loading的新请求最少需要decode出新的token量
+        self.min_generated_num = 64
 
         loading_tokens = 0
         loading_reqs = 0
         for req in self.loading_reqs:
             loading_reqs += 1
-            # 我们假定loading的新请求至少需要多decode一秒钟的token量
-            loading_tokens += len(req.output_ids) + len(req.origin_input_ids) + self.output_speed[req.rid]
+            loading_tokens += len(req.output_ids) + len(req.origin_input_ids) + self.min_generated_num
         evicting_tokens = 0
         evicting_reqs = 0
         for req in self.evicting_reqs:
@@ -62,7 +63,7 @@ class MyScheduleDecision():
             evicting_tokens += len(req.output_ids) + len(req.origin_input_ids)
 
         self.max_tokens = token_to_kv_pool.size - loading_tokens - evicting_tokens
-        self.max_running_requests = max_running_requests - loading_reqs - evicting_reqs - 5
+        self.max_running_requests = max_running_requests - loading_reqs - evicting_reqs
         self.max_prefill_tokens = max_prefill_tokens
 
         self.avail_tokens = self.max_tokens
@@ -79,21 +80,16 @@ class MyScheduleDecision():
             len(req.origin_input_ids) + len(req.output_ids) + min_generated_num
         )
 
-    def initialize_keep_running_list(self):
+    def initialize_keep_running_list(self, available_tokens, available_requests):
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
         for req in self.running_reqs:
-            kv_budget = self.estimate_req_kv_budget(req)
-            if self.avail_running_requests > 0 and self.avail_tokens >= kv_budget:
-                self.keep_running_list.append(req)
-                self.avail_running_requests -= 1
-                self.avail_tokens -= kv_budget
+            if self.can_add_request(req):
+                self.add_request(req)
+        # self.avail_running_requests = available_requests
 
     def remove_request(self, req):
         if req not in self.keep_running_list and req not in self.new_load_list and req not in self.new_prefill_list:
-            print(self.keep_running_list)
-            print(self.new_load_list)
-            print(self.new_prefill_list)
             assert False, "Try to remove request not exist"
         
         if req in self.keep_running_list:
@@ -108,6 +104,7 @@ class MyScheduleDecision():
         self.avail_tokens += self.estimate_req_kv_budget(req)
     
     def can_add_request(self, req, recompute=False):
+        # print(self.avail_prefill_tokens, self.avail_running_requests, self.avail_tokens, req)
         if req in self.keep_running_list or req in self.new_load_list or req in self.new_prefill_list:
             return False
         
@@ -285,14 +282,15 @@ class MyScheduler(Scheduler):
         self.schedule_decision = None
         self.last_running_time = None
         self.offload_manager = MyRequestOffloadManager(self.tree_cache)
+        self.req_last_run_time = {}
 
         # Some custom scheduler config
-        self.high_watermark_ratio = 5.0
+        self.high_watermark_ratio = 3.0
         self.low_watermark_ratio = 1.0
         self.reschedule_interval = 1.0
-        self.log_batch_status = True
+        self.log_batch_status = False
         self.runtime_check = False
-        self.debug_log = True
+        self.debug_log = False
     
     @torch.no_grad()
     def event_loop_normal(self):
@@ -371,8 +369,8 @@ class MyScheduler(Scheduler):
     def handle_generate_request(self, recv_req):
         self.cum_buffer_size[recv_req.rid] = 0
         self.rebuffer_time[recv_req.rid] = 0.0
-        self.output_speed[recv_req.rid] = random.choice([5.0, 10.0])
-        print(f'{recv_req.rid} {self.output_speed[recv_req.rid]}', file=open('tmp/output_speed_info.log', 'a'))
+        self.output_speed[recv_req.rid] = recv_req.sampling_params.output_speed
+        # print(f'{recv_req.rid} {self.output_speed[recv_req.rid]}', file=open('tmp/output_speed_info.log', 'a'))
         # self.output_speed[recv_req.rid] = 10.0
         return super().handle_generate_request(recv_req)
 
@@ -387,34 +385,14 @@ class MyScheduler(Scheduler):
                     self.rebuffer_time[rid] += during_time - \
                         self.cum_buffer_size[rid] / self.output_speed[rid]
                     self.cum_buffer_size[rid] = 0
-            # print(self.cum_buffer_size)
-
-    def get_valid_throughput(self):
-        # currently we use e^{-x} as the valid throughput
-        # e.g. if cum_buffer_size = 0, then throughput = 1
-        # the larger the cum_buffer_size, the smaller the throughput
-        valid_thr = {}
-        if self.waiting_queue is not None:
-            for req in self.waiting_queue:
-                assert req.rid in self.cum_buffer_size, \
-                    "Request not in cum_buffer_size, but it should be added when the request is received."
-                valid_thr[req] = math.exp(-self.cum_buffer_size[req.rid])
-        
-        if self.running_batch is not None:
-            for req in self.running_batch.reqs:
-                assert req.rid in self.cum_buffer_size, \
-                    "Request not in cum_buffer_size, but it should be added when the request is received."
-                valid_thr[req] = math.exp(-self.cum_buffer_size[req.rid])
-        
-        return valid_thr
 
     def estimate_load_cost(self, req):
-        return (len(req.origin_input_ids) + len(req.output_ids)) / 20480 
+        return (len(req.origin_input_ids) + len(req.output_ids)) / 409600
 
     def estimate_evict_cost(self, req):
         return self.estimate_load_cost(req) / 2
     
-    def estimate_recompute_cost(self,req):
+    def estimate_recompute_cost(self, req):
         if len(req.output_ids) == 0:
             return 0
         else:
@@ -422,47 +400,59 @@ class MyScheduler(Scheduler):
 
     def evaluate_objective(self, schedule_decision, value):
         total_value = 0
+        io_request_cnt = self.offload_manager.get_total_reqs()
+        all_reqs = schedule_decision.keep_running_list + schedule_decision.new_prefill_list + schedule_decision.new_load_list
+        all_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in all_reqs]
+        estimate_decode_time = sum(all_tokens) * (0.032536983489990234 / 20551)
+
         evicted_reqs = set(schedule_decision.running_reqs) - set(schedule_decision.keep_running_list)
         evicted_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in evicted_reqs]
+        estimate_evict_time = sum(evicted_tokens) / 409600
+
         load_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in schedule_decision.new_load_list]
+        estimate_load_time = sum(load_tokens) / 409600
+
         prefill_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in schedule_decision.new_prefill_list]
+        estimate_prefill_time = sum(prefill_tokens) * (0.12375879287719727 / 15388)
 
         for req in schedule_decision.keep_running_list:
             total_value += value.get(req, 0)
         for req in schedule_decision.new_load_list:
-            total_value += value.get(req, 0)
+            total_value += value.get(req, 0) * ((estimate_decode_time - estimate_evict_time - estimate_load_time) / estimate_decode_time) * math.exp(-io_request_cnt / self.max_running_requests)
         for req in schedule_decision.new_prefill_list:
-            total_value += value.get(req, 0)
+            total_value += value.get(req, 0) * ((estimate_decode_time - estimate_evict_time - estimate_prefill_time) / estimate_decode_time)
 
         return total_value - sum(evicted_tokens) / 40960 - max(sum(load_tokens) / 20480, sum(prefill_tokens) / 10240)
 
-    def initial_greedy_selection(self, schedule_decision, value):
-        candidates = []
+    def greedy_selection(self, schedule_decision, value, candidates=None):
+        # Simple greedy algorithm for request selection
+        if candidates is None:
+            candidates = []
 
-        for req in schedule_decision.running_reqs:
-            v = value.get(req, 0)
-            adjusted_value = v  # running继续保留没有额外代价
-            size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
-            candidates.append((req, adjusted_value, size, 'running', False))
+            for req in schedule_decision.running_reqs:
+                v = value.get(req, 0)
+                adjusted_value = v  # running继续保留没有额外代价
+                size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
+                candidates.append((req, adjusted_value, size, 'running', False))
 
-        for req in schedule_decision.waiting_reqs:
-            v = value.get(req, 0)
-            size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
+            for req in schedule_decision.waiting_reqs:
+                v = value.get(req, 0)
+                size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
 
-            # 预先计算两种可能
-            if self.tree_cache.can_load_back(req):
-                # 直接load方式
-                load_cost = self.estimate_load_cost(req)
-                adjusted_value_load = v - load_cost
-                candidates.append((req, adjusted_value_load, size, 'waiting', False))  # recompute=False
-            
-            # prefilling方式
-            recompute_cost = self.estimate_recompute_cost(req)
-            adjusted_value_recompute = v - recompute_cost
-            candidates.append((req, adjusted_value_recompute, size, 'waiting', True))  # recompute=True
+                # 预先计算两种可能
+                if self.tree_cache.can_load_back(req):
+                    # 直接load方式
+                    load_cost = self.estimate_load_cost(req)
+                    adjusted_value_load = v - load_cost
+                    candidates.append((req, adjusted_value_load, size, 'waiting', False))  # recompute=False
+                
+                # prefilling方式
+                recompute_cost = self.estimate_recompute_cost(req)
+                adjusted_value_recompute = v - recompute_cost
+                candidates.append((req, adjusted_value_recompute, size, 'waiting', True))  # recompute=True
 
-        # 按 adjusted value / size 排序，性价比高的优先
-        candidates.sort(key=lambda x: -x[1])
+            # 按 adjusted value 排序，性价比高的优先
+            candidates.sort(key=lambda x: -x[1])
 
         for req, adjusted_value, size, source, recompute in candidates:
             if source == 'running':
@@ -473,6 +463,7 @@ class MyScheduler(Scheduler):
                     schedule_decision.add_request(req, recompute=recompute)
     
     def local_search(self, schedule_decision, value):
+        # After greedy search, we can use local search to do some small change to schedule decision
         improved = True
 
         while improved:
@@ -513,6 +504,27 @@ class MyScheduler(Scheduler):
                 if improved:
                     break
     
+    def get_valid_throughput(self):
+        # currently we use e^{-x} as the valid throughput
+        # e.g. if cum_buffer_size = 0, then throughput = 1
+        # the larger the cum_buffer_size, the smaller the throughput
+        valid_thr = {}
+        if self.waiting_queue is not None:
+            for req in self.waiting_queue:
+                assert req.rid in self.cum_buffer_size, \
+                    "Request not in cum_buffer_size, but it should be added when the request is received."
+                valid_thr[req] = \
+                    (self.cum_buffer_size[req.rid] - min(self.estimate_load_cost(req), self.estimate_evict_cost(req)) * self.output_speed[req.rid]) * \
+                    (self.reschedule_interval - min(self.estimate_load_cost(req), self.estimate_evict_cost(req)))
+        
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                assert req.rid in self.cum_buffer_size, \
+                    "Request not in cum_buffer_size, but it should be added when the request is received."
+                valid_thr[req] = self.cum_buffer_size[req.rid] * self.reschedule_interval
+        
+        return valid_thr
+    
     def generate_schedule_decision(self):
         valid_thr = self.get_valid_throughput()
 
@@ -521,15 +533,76 @@ class MyScheduler(Scheduler):
                                             self.waiting_queue, self.offload_manager.get_all_load_reqs(), self.offload_manager.get_all_evict_reqs(),
                                             self.max_running_requests, self.max_prefill_tokens, self.new_token_ratio)
 
-        self.initial_greedy_selection(schedule_decision, valid_thr)
-        self.local_search(schedule_decision, valid_thr)
+        schedule_decision.initialize_keep_running_list(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size())
+
+        # filter_for_overflow_buffer = []
+        # for req in schedule_decision.keep_running_list:
+        #     if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * self.high_watermark_ratio:
+        #         filter_for_overflow_buffer.append(req)
+        # for req in filter_for_overflow_buffer:
+        #     schedule_decision.remove_request(req)
+
+        # First, we check if the result satisfied the QoS standard to get next batch size
+        # next_running_batch_size = len(schedule_decision.keep_running_list)
+        # if self.last_running_time is not None and next_running_batch_size != 0 and not self.last_batch.forward_mode.is_extend():
+        #     last_schedule_thr = 1.0 / self.last_running_time
+        #     satisfied = True
+        #     for req in schedule_decision.keep_running_list:
+        #         if last_schedule_thr < self.output_speed[req.rid]:
+        #             satisfied = False
+        #     if satisfied:
+        #         next_running_batch_size = min(int(len(schedule_decision.keep_running_list) * 1.1), self.max_running_requests)
+        #     else:
+        #         next_running_batch_size = int(len(schedule_decision.keep_running_list) * 0.9)
+        # else:
+        #     next_running_batch_size = self.max_running_requests
+        next_running_batch_size = self.max_running_requests
+
+        # Second, we sort the keep_running_list to get the possible evictable requests
+        # These request are the last 40% in the keep_running_list
+        evictable_reqs = []
+        evictable_cnt = int(len(schedule_decision.keep_running_list) * 0.4)
+        for req in schedule_decision.keep_running_list:
+            evictable_reqs.append((req, valid_thr[req], self.req_last_run_time[req.rid]))
+        evictable_reqs = sorted(evictable_reqs, key=lambda x: (-x[1], -x[2]))
+        evictable_reqs = evictable_reqs[-evictable_cnt:]
+        for req in evictable_reqs:
+            schedule_decision.remove_request(req[0])
+
+        # Third, trade-off the evictable_reqs with reqs in the waiting queue
+        # Using the objective function defined above
+        budget_reqs_num = next_running_batch_size - (len(schedule_decision.keep_running_list) - len(evictable_reqs))
+        io_reqs_num = self.offload_manager.get_total_reqs()
+        if budget_reqs_num <= 0:
+            return schedule_decision
+        # self.offload_manager.avail_running_requests = budget_reqs_num
+        budget_candidate = []
+        for req in evictable_reqs:
+            size = len(req[0].origin_input_ids) + len(req[0].output_ids) + max(self.output_speed[req[0].rid] - self.cum_buffer_size[req[0].rid], 0)
+            budget_candidate.append((req[0], valid_thr[req[0]], size, 'running', False))
+        for req in self.waiting_queue:
+            size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
+            if self.tree_cache.can_load_back(req):
+                budget_candidate.append((req, 
+                    valid_thr[req], #* (1 - io_reqs_num/self.max_running_requests * 0.01) - self.estimate_load_cost(req) * 0.01, 
+                    size, 'waiting', False))
+            budget_candidate.append((req, 
+                valid_thr[req], #- self.estimate_recompute_cost(req) * 0.01, 
+                size, 'waiting', True))
+        # print(budget_candidate)
+        budget_candidate = budget_candidate.sort(key=lambda x: (-x[1]))
+        self.greedy_selection(schedule_decision, valid_thr, budget_candidate)
+        # self.local_search(schedule_decision, valid_thr)
+
+        # DEBUG: Print the detail of schedule decision to log
         print('keep_running_list', schedule_decision.keep_running_list, file=open('tmp/schedule_output.txt', "a"))
-        print(len(schedule_decision.keep_running_list), file=open('tmp/schedule_output.txt', "a"))
+        print(len(schedule_decision.keep_running_list), len(schedule_decision.running_reqs), file=open('tmp/schedule_output.txt', "a"))
         print('new_load_list', schedule_decision.new_load_list, file=open('tmp/schedule_output.txt', "a"))
         print(len(schedule_decision.new_load_list), file=open('tmp/schedule_output.txt', "a"))
         print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
         print(len(schedule_decision.new_prefill_list), file=open('tmp/schedule_output.txt', "a"))
         print('--------------------------------', file=open('tmp/schedule_output.txt', "a"))
+
         return schedule_decision
             
     def get_next_batch_to_run(self):
@@ -586,14 +659,44 @@ class MyScheduler(Scheduler):
 
         # update_buffer_size()
         self.update_buffer_size()
-        
+
+        if self.runtime_check and self.running_batch is not None:
+            # print(self.running_batch)
+            for i,req in enumerate(self.running_batch.reqs):
+                # check the running request req_to_token_pool is not available
+                if req.req_pool_idx in self.req_to_token_pool.free_slots:
+                    print(req.req_pool_idx)
+                    assert False, f"why running request {req.rid}'s req_pool_idx {req.req_pool_idx} is available??"
+ 
+                # check running request token slot is released by error
+                if torch.isin(self.token_to_kv_pool.free_slots, 
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]].clone()
+                .to(self.token_to_kv_pool.free_slots.device),).any():
+                    print(self.req_to_token_pool.req_to_token[req.req_pool_idx, :self.running_batch.seq_lens[i]])
+                    assert False, \
+                    f"why running request {req.rid}'s token slots is in the free slots list??"
+ 
+            # check if two running request share the token slots
+            for i in range(len(self.running_batch.reqs)):
+                for j in range(i+1, len(self.running_batch.reqs)):
+                    if torch.isin(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]], 
+                    torch.tensor(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]], 
+                                    device=(self.req_to_token_pool.req_to_token.device))).any():
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]])
+                        print(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]])
+                        print('i', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[i].req_pool_idx, :self.running_batch.seq_lens[i]]))
+                        print('j', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]]))
+                        assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
+    
         if (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval) and self.offload_manager.is_all_evict_finished():
-            print('here')
             if self.next_prefill_batch is not None:
-                print('delayed prefill now')
                 ret = self.next_prefill_batch
                 self.next_prefill_batch = None
                 ret.prepare_for_extend()
+
+                # update request last run time
+                for req in ret.reqs:
+                    self.req_last_run_time[req.rid] = time.time()
                 return ret
             
             self.last_schedule = time.time()
@@ -602,13 +705,14 @@ class MyScheduler(Scheduler):
                 before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
             else:
                 before_req_nums = len(self.waiting_queue) + self.offload_manager.get_total_reqs()
-            
+            # print(self.cum_buffer_size, file=open('tmp/buffer_size.log', 'a'))
+            if self.running_batch is not None:
+                print('before_req_nums', before_req_nums)
+                print(self.req_to_token_pool.available_size(), len(self.running_batch.reqs))
             self.schedule_decision = self.generate_schedule_decision()
             
             if len(self.schedule_decision.new_prefill_list) == 0 and len(self.schedule_decision.keep_running_list) == 0 and len(self.schedule_decision.new_load_list) == 0:
                 return None
-            
-            print(len(self.schedule_decision.new_prefill_list), len(self.schedule_decision.new_load_list), len(self.schedule_decision.keep_running_list))
 
             # first we get the evict request list and filter the running batch
             evict_list = []
@@ -623,7 +727,7 @@ class MyScheduler(Scheduler):
                 for i, req in enumerate(evict_list):
                     idx = self.running_batch.reqs.index(req)
                     if isinstance(self.tree_cache, SyncChunkCache):
-                        # print(f'evict {req.rid} for {seq_lens_cpu[idx]} tokens')
+                        print(f'evict {req.rid} for {seq_lens_cpu[idx]} tokens')
                         self.offload_manager.add_evict_request(req, seq_lens_cpu[idx])
                     elif isinstance(self.tree_cache, ChunkCache):
                         # ChunkCache directly evict all tokens
@@ -699,7 +803,18 @@ class MyScheduler(Scheduler):
                     # print('directly do prefill after evict')
                     ret = self.next_prefill_batch
                     self.next_prefill_batch = None
-                    ret.prepare_for_extend()
+                    try:
+                        ret.prepare_for_extend()
+                    except Exception as e:
+                        print(ret.reqs)
+                        total_tokens = 0
+                        for req in ret.reqs:
+                            total_tokens += len(req.output_ids) + len(req.origin_input_ids)
+                        print(total_tokens, self.token_to_kv_pool.available_size())
+                        print(len(ret.reqs), self.req_to_token_pool.available_size())
+                        print(len(self.schedule_decision.keep_running_list) + len(self.schedule_decision.new_load_list) + len(self.schedule_decision.new_prefill_list), 
+                              self.req_to_token_pool.size)
+                        raise e
                 else:
                     if self.running_batch is None:
                         ret = None
@@ -739,7 +854,11 @@ class MyScheduler(Scheduler):
             if self.running_batch is None:
                 ret = None
             else:
-                self.running_batch = self.update_running_batch(self.running_batch)
+                try:
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                except Exception as e:
+                    print(self.running_batch.reqs)
+                    raise e
                 ret = self.running_batch
 
         # Keep the old code
@@ -758,7 +877,12 @@ class MyScheduler(Scheduler):
         # Handle DP attention
         if self.server_args.enable_dp_attention:
             ret = self.prepare_dp_attn_batch(ret)
-        
+
+        # update request last run time
+        if ret is not None:
+            for req in ret.reqs:
+                self.req_last_run_time[req.rid] = time.time()
+            
         if ret is not None and self.debug_log:
             print('----------------------', file=open('tmp/debug_log.txt', 'a'))
             for req in ret.reqs:

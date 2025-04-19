@@ -65,6 +65,8 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    output_speed: int = 40
+    buffer_size: List[float] = field(default_factory=list)
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -118,10 +120,16 @@ async def async_request_trt_llm(
                         if ttft == 0.0:
                             ttft = time.perf_counter() - st
                             output.ttft = ttft
-
+                            output.buffer_size.append(0)
                         # Decoding phase
                         else:
                             output.itl.append(timestamp - most_recent_timestamp)
+                            prev_buffer = output.buffer_size[-1]
+                            buffer_now = prev_buffer - (timestamp - most_recent_timestamp) * output.output_speed
+                            if buffer_now > 0:
+                                output.buffer_size.append(buffer_now)
+                            else:
+                                output.buffer_size.append(0)
 
                         most_recent_timestamp = timestamp
 
@@ -310,6 +318,7 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
+    speed = random.choice([15.0, 30.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -318,6 +327,7 @@ async def async_request_sglang_generate(
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": not args.disable_ignore_eos,
+                "output_speed": speed,
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
@@ -329,6 +339,7 @@ async def async_request_sglang_generate(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.output_speed = speed
 
         generated_text = ""
         ttft = 0.0
@@ -361,11 +372,16 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
-
+                                    output.buffer_size.append(0)
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
-
+                                    prev_buffer = output.buffer_size[-1]
+                                    buffer_now = prev_buffer + 1 - (timestamp - most_recent_timestamp) * output.output_speed
+                                    if buffer_now > 0:
+                                        output.buffer_size.append(buffer_now)
+                                    else:
+                                        output.buffer_size.append(0)
                                 most_recent_timestamp = timestamp
                                 generated_text = data["text"]
 
@@ -384,6 +400,7 @@ async def async_request_sglang_generate(
     if pbar:
         pbar.update(1)
     return output
+
 
 
 async def async_request_gserver(
@@ -836,6 +853,8 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    with open('benchmark_result.pkl', 'wb') as f:
+        pickle.dump(outputs, f)
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_len

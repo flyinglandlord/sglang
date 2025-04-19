@@ -655,6 +655,7 @@ class ScheduleBatch:
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
+            print('Req to token pool', self.req_to_token_pool.size, self.req_to_token_pool.available_size())
             raise RuntimeError(
                 "Out of memory. "
                 "Please set a smaller number for `--max-running-requests`."
