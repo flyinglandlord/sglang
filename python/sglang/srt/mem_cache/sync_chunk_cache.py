@@ -89,6 +89,7 @@ class SyncChunkCache(ChunkCache):
         else: 
             print(f"WARNING: Request {req.rid} finished right after prefill")
         # then call base class to free device memory
+        print('free', req.rid)
         super().cache_finished_req(req, token_ids)
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):

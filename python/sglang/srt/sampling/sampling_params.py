@@ -48,8 +48,11 @@ class SamplingParams:
         no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
+        output_speed: int = 40,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self.output_speed = output_speed
+
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
