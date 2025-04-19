@@ -80,15 +80,13 @@ class MyScheduleDecision():
             len(req.origin_input_ids) + len(req.output_ids) + min_generated_num
         )
 
-    def initialize_keep_running_list(self):
+    def initialize_keep_running_list(self, available_tokens, available_requests):
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
         for req in self.running_reqs:
-            kv_budget = self.estimate_req_kv_budget(req)
-            if self.avail_running_requests > 0 and self.avail_tokens >= kv_budget:
-                self.keep_running_list.append(req)
-                self.avail_running_requests -= 1
-                self.avail_tokens -= kv_budget
+            if self.can_add_request(req):
+                self.add_request(req)
+        # self.avail_running_requests = available_requests
 
     def remove_request(self, req):
         if req not in self.keep_running_list and req not in self.new_load_list and req not in self.new_prefill_list:
@@ -535,7 +533,7 @@ class MyScheduler(Scheduler):
                                             self.waiting_queue, self.offload_manager.get_all_load_reqs(), self.offload_manager.get_all_evict_reqs(),
                                             self.max_running_requests, self.max_prefill_tokens, self.new_token_ratio)
 
-        schedule_decision.initialize_keep_running_list()
+        schedule_decision.initialize_keep_running_list(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size())
 
         # filter_for_overflow_buffer = []
         # for req in schedule_decision.keep_running_list:
