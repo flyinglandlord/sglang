@@ -118,6 +118,9 @@ class SyncChunkCache(ChunkCache):
 
     def get_evicting_reqs(self) -> List[str]:
         return list(self.req_to_evict.keys())
+    
+    def get_removing_reqs(self) -> List[str]:
+        return list(self.req_to_remove.keys())
 
     def _evict_device(self, req: Req, seq_len: int):
         # evict a request in device memory, but still exist in host memory
@@ -141,7 +144,7 @@ class SyncChunkCache(ChunkCache):
         req.last_node = entry
         req.req_pool_idx = None
 
-    def load_back(self, req: Req):
+    def load_back(self, req: Req, load_indices: Optional[torch.Tensor] = None):
         rid = req.rid
         if rid not in self.entries:
             raise RuntimeError(f"Request {rid} not in cache")
@@ -155,7 +158,12 @@ class SyncChunkCache(ChunkCache):
         if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
             raise RuntimeError(f"Request {rid} is writing")
         # allocate device memory
-        device_indices = self.cache_controller.load(entry.host_value, node_id=entry)
+        host_value = entry.host_value
+        if load_indices is not None:
+            host_value = host_value[load_indices]
+            assert host_value.shape[0] == load_indices.shape[0], \
+                f"host_value {host_value.shape[0]} != load_indices {load_indices.shape[0]}"
+        device_indices = self.cache_controller.load(host_value, node_id=entry)
         if device_indices is None:
             raise RuntimeError(f'Failed to allocate device memory for request {rid}')
         # update the entry
@@ -163,6 +171,21 @@ class SyncChunkCache(ChunkCache):
         entry.loading = True
         entry.value = device_indices
         entry.evicted = False
+    
+    def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
+        if self.kv_selector is None:
+            return self.load_back(req)
+        assert req.rid in self.entries, f"Request {req.rid} not in cache"
+        if target_length > self.entries[req.rid].host_value.shape[0]:
+            print(f"target_length {target_length} less than host_vlaue length {self.entries[req.rid].host_value.shape[0]} rid: {req.rid}")
+            return self.load_back(req)
+        if wait:
+            self.kv_selector.wait_for_ready(req)
+        indices = self.kv_selector.select_kv(req, target_length)
+        print(f"Request {req.rid} selected kv {indices.shape[0]} for loading")
+        if indices is None:
+            raise RuntimeError(f"Failed to select kv for request {req.rid}")
+        self.load_back(req, indices)
 
     def load_check(self, req: Optional[Req] = None) -> Optional[bool]:
         # synchronize the loading status

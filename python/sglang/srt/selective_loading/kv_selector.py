@@ -2,7 +2,6 @@ import time
 import torch
 import logging
 import threading
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, Set, List, Tuple, Optional
 from queue import Empty, Full, Queue
@@ -26,17 +25,13 @@ class KVSelectOperation:
 class KVSelectEntry:
     def __init__(self, rid: str, input_ids: Tuple[int], output_ids: List[int]):
         self.rid = rid
-        self.input_ids = deepcopy(input_ids)
-        self.output_ids = deepcopy(output_ids)
+        self.fill_ids: List[int] = input_ids + output_ids
+        self.originial_input_len: int = len(input_ids)
         self.accumu_length: int = 0
         self.last_compute_time: float = 0.0
         self.total_compute_time: float = 0.0
-        # NOTE: `last_length` is the length of the request last seen by this entry
-        # it is used to update output_ids when new tokens are generated.
-        # Also, when the request undergoes a kv selection, the `last_length`
-        # is the length of the selected input_ids + output_ids.
-        self.last_length = len(input_ids) + len(output_ids)
         self.accumu_attn_scores: Optional[torch.Tensor] = None
+        self.last_length: int = len(self.fill_ids)
     
     def update_output_ids(self, req: Req):
         assert req.rid == self.rid, f"Request ID mismatch: {req.rid} != {self.rid}"
@@ -44,14 +39,14 @@ class KVSelectEntry:
         assert len(req.output_ids) >= num_token_new >= 0, \
             f"Invalid token update: {num_token_new} new tokens, " \
             f"output_ids length {len(req.output_ids)}, last_length {self.last_length}"
-        self.output_ids.extend(req.output_ids[-num_token_new:])
+        self.fill_ids.extend(req.output_ids[-num_token_new:])
         self.last_length += num_token_new
     
     def restore_req(self, req: Req):
         assert req.rid == self.rid, f"Request ID mismatch: {req.rid} != {self.rid}"
-        req.origin_input_ids = self.input_ids
-        req.output_ids = self.output_ids
-        self.last_length = len(self.input_ids) + len(self.output_ids)
+        req.origin_input_ids = self.fill_ids[:self.originial_input_len]
+        req.output_ids = self.fill_ids[self.originial_input_len:]
+        self.last_length = len(self.fill_ids)
 
 
 class KVSelector:
@@ -138,6 +133,45 @@ class KVSelector:
         else:
             logger.warning(f"Request {req.rid} not found in KVSelectEntry, ignoring restore")
     
+    def select_ready(self, req: Req) -> bool:
+        if req.rid in self.entries:
+            entry: KVSelectEntry = self.entries[req.rid]
+            if entry.accumu_attn_scores is None:
+                return False
+        return False
+
+    def wait_for_ready(self, req: Req) -> bool:
+        if req.rid in self.entries:
+            entry: KVSelectEntry = self.entries[req.rid]
+            while entry.accumu_attn_scores is None and not self.stop_event.is_set():
+                time.sleep(0.01)
+            return True
+        else:
+            logger.warning(f"Request {req.rid} not found in KVSelectEntry, ignoring wait")
+        return False
+    
+    def select_kv(self, req: Req, target_length: int) -> Optional[torch.Tensor]:
+        entry: KVSelectEntry = self.entries.get(req.rid)
+        if entry is None or entry.accumu_attn_scores is None:
+            return None
+        attn_scores = entry.accumu_attn_scores
+        full_length = len(entry.fill_ids) - 1
+        print(f'req {req.rid} attn_scores shape {attn_scores.shape}, full_length {full_length}')
+        keep_length = max(64, full_length - attn_scores.shape[0])
+        if keep_length > target_length:
+            return None
+        _, indices = attn_scores.topk(target_length - keep_length, dim=0, largest=True, sorted=False)
+        indices = torch.cat([indices, torch.arange(full_length - keep_length, full_length)])
+        req.origin_input_ids = []
+        req.output_ids = []
+        for i in indices:
+            if i < entry.originial_input_len:
+                req.origin_input_ids.append(entry.fill_ids[i])
+            else:
+                req.output_ids.append(entry.fill_ids[i])
+        entry.last_length = indices.shape[0]
+        return indices
+
     def req_finished(self, rid: str) -> None:
         if rid in self.compute_op_count:
             if self.compute_op_count[rid] > 0:
@@ -200,5 +234,5 @@ class KVSelector:
         elapsed_time = time.time() - time_start
         entry.total_compute_time += elapsed_time
         entry.last_compute_time = elapsed_time
-        print(f"KVSelector: compute op {op.rid} time {elapsed_time:.4f}s, "
-              f"accumulated time {entry.total_compute_time:.4f}s")
+        # print(f"KVSelector: compute op {op.rid} time {elapsed_time:.4f}s, "
+        #       f"accumulated time {entry.total_compute_time:.4f}s")
