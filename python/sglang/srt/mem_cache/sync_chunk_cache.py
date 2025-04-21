@@ -8,15 +8,11 @@ import threading
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Set, Dict
 from queue import Empty
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from python.sglang.srt.mem_cache.chunk_cache import ChunkCache, ChunkCacheEntry
 from sglang.srt.managers.cache_controller import HiCacheController, CacheOperation
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import (
-    BaseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPoolHost,
-    MemoryStateInt,
     ReqToTokenPool,
 )
 from sglang.srt.selective_loading.kv_selector import KVSelector
@@ -30,15 +26,21 @@ class SyncChunkCache(ChunkCache):
     def __init__(
         self, 
         req_to_token_pool: ReqToTokenPool, 
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: MHATokenToKVPool,
     ):
+        assert isinstance(token_to_kv_pool, MHATokenToKVPool), \
+            f"token_to_kv_pool must be MHATokenToKVPool, but got {type(req_to_token_pool)}"
         self.req_write_op_count = {}
         self.req_to_remove: Dict[str, Optional[List[int]]] = {}
         self.req_to_evict: Dict[str, int] = {}
         self.kv_selector: Optional[KVSelector] = None
+        self.token_to_kv_pool = token_to_kv_pool
         self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        initial_load_speed = self._initial_profile()
+        print(f"Initial load speed: {initial_load_speed:.2f} tokens/s")
+        self.loading_token_num = 0
         self.cache_controller = HiCacheController(
-            token_to_kv_pool, self.token_to_kv_pool_host, self.req_to_remove
+            token_to_kv_pool, self.token_to_kv_pool_host, initial_load_speed, self.req_to_remove,
         )
         self.stop_event = threading.Event()
         self.entries_lock = threading.Lock()
@@ -89,7 +91,6 @@ class SyncChunkCache(ChunkCache):
         else: 
             print(f"WARNING: Request {req.rid} finished right after prefill")
         # then call base class to free device memory
-        print('free', req.rid)
         super().cache_finished_req(req, token_ids)
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
@@ -147,17 +148,18 @@ class SyncChunkCache(ChunkCache):
 
     def load_back(self, req: Req, load_indices: Optional[torch.Tensor] = None):
         rid = req.rid
-        if rid not in self.entries:
-            raise RuntimeError(f"Request {rid} not in cache")
-        entry: ChunkCacheEntry = self.entries[rid]
-        if not entry.backuped:
-            raise RuntimeError(f"Request {rid} not backuped")
-        if entry.host_value is None:
-            raise RuntimeError(f"Host value is None for rid {rid}")
-        if entry.loading:
-            raise RuntimeError(f"Request {rid} is loading")
-        if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
-            raise RuntimeError(f"Request {rid} is writing")
+        with self.entries_lock:
+            if rid not in self.entries:
+                raise RuntimeError(f"Request {rid} not in cache")
+            entry: ChunkCacheEntry = self.entries[rid]
+            if not entry.backuped:
+                raise RuntimeError(f"Request {rid} not backuped")
+            if entry.host_value is None:
+                raise RuntimeError(f"Host value is None for rid {rid}")
+            if entry.loading:
+                raise RuntimeError(f"Request {rid} is loading")
+            if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
+                raise RuntimeError(f"Request {rid} is writing")
         # allocate device memory
         host_value = entry.host_value
         if load_indices is not None:
@@ -172,6 +174,11 @@ class SyncChunkCache(ChunkCache):
         entry.loading = True
         entry.value = device_indices
         entry.evicted = False
+        self.loading_token_num += device_indices.shape[0]
+
+    def get_loading_workload(self) -> Tuple[int, float]:
+        self.load_check()
+        return self.loading_token_num, self.cache_controller.running_load_speed
     
     def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
         if self.kv_selector is None:
@@ -199,6 +206,7 @@ class SyncChunkCache(ChunkCache):
                 if not entry.loading:
                     raise RuntimeError(f"Entry {ack.rid} is not loading")
                 entry.loading = False
+                self.loading_token_num -= ack.value.shape[0]
             except Exception as e:
                 break
         if req is not None and req.rid in self.entries:
@@ -328,3 +336,22 @@ class SyncChunkCache(ChunkCache):
                     self._sync_prefill(req, seq_lens_cpu[i])
                 else:
                     self._sync_decode(req, seq_lens_cpu[i])
+    
+    def _initial_profile(self) -> float:
+        PROFILE_SEQ_LENGTH = 1024
+        device_indices = self.token_to_kv_pool.alloc(PROFILE_SEQ_LENGTH)
+        if device_indices is None:
+            raise RuntimeError("Failed to allocate device memory for profiling")
+        host_indices = self.token_to_kv_pool_host.alloc(PROFILE_SEQ_LENGTH)
+        if host_indices is None:
+            raise RuntimeError("Failed to allocate host memory for profiling")
+        data = self.token_to_kv_pool_host.get_flat_data(host_indices)
+        data = data.contiguous().pin_memory()
+        start_time = time.time()
+        self.token_to_kv_pool.transfer(device_indices, data)
+        end_time = time.time()
+        # free the resources
+        self.token_to_kv_pool.free(device_indices)
+        self.token_to_kv_pool_host.free(host_indices)
+        # return the throughput
+        return PROFILE_SEQ_LENGTH / (end_time - start_time)

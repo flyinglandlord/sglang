@@ -16,9 +16,10 @@ limitations under the License.
 import concurrent.futures
 import logging
 import math
+import time
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 
 import torch
 
@@ -129,7 +130,8 @@ class HiCacheController:
         self,
         mem_pool_device: MHATokenToKVPool,
         mem_pool_host: MLATokenToKVPoolHost,
-        req_to_remove = None,
+        initial_load_speed: float = 0.0,
+        req_to_remove: Set[str] = None,
         write_policy: str = "write_through_selective",
     ):
 
@@ -170,6 +172,8 @@ class HiCacheController:
         )
         self.write_thread.start()
         self.load_thread.start()
+
+        self.running_load_speed: float = initial_load_speed
 
     def reset(self):
         self.stop_event.set()
@@ -423,8 +427,14 @@ class HiCacheController:
                 operation = self.load_buffer.get()
                 if operation is None:
                     continue
+                start_time = time.time()
                 self.mem_pool_device.transfer(operation.device_indices, operation.data)
                 self.mem_pool_host.complete_io(operation.host_indices)
+                elapsed_time = time.time() - start_time # `transfer` is blocking
+                load_speed = operation.device_indices.shape[0] / elapsed_time
+                self.running_load_speed = ( # smooth the average load speed
+                    self.running_load_speed * 0.9 + load_speed * 0.1
+                )
                 for node_id in operation.node_ids:
                     if node_id != 0:
                         self.ack_load_queue.put(node_id)
