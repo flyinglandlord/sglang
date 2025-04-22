@@ -699,6 +699,8 @@ class MyScheduler(Scheduler):
                     self.req_last_run_time[req.rid] = time.time()
                 return ret
             
+            print("Write wating:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num)
+            
             self.last_schedule = time.time()
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
