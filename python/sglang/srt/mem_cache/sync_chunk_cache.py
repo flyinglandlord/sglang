@@ -6,7 +6,8 @@ import threading
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Set, Dict
-from queue import Empty
+from queue import Empty, Queue
+from dataclasses import dataclass
 
 from python.sglang.srt.mem_cache.chunk_cache import ChunkCache, ChunkCacheEntry
 from sglang.srt.managers.cache_controller import HiCacheController, CacheOperation
@@ -22,6 +23,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
+@dataclass
+class WriteRecord:
+    writing_queue: Queue[int]
+    last_writing_pos: int
+    evicted_len: int = 0
+    written_len: int = 0
+
 class SyncChunkCache(ChunkCache):
     def __init__(
         self, 
@@ -36,9 +44,13 @@ class SyncChunkCache(ChunkCache):
         self.kv_selector: Optional[KVSelector] = None
         self.token_to_kv_pool = token_to_kv_pool
         self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
-        initial_load_speed = self._initial_profile()
-        print(f"Initial load speed: {initial_load_speed:.2f} tokens/s")
+        # data fields for loading and writing profilers
+        initial_load_speed, self.write_speed = self._initial_profile()
+        print(f"Initial load speed: {initial_load_speed:.2f} tokens/s, write speed: {self.write_speed:.2f} tokens/s")
         self.loading_token_num = 0
+        self.write_token_num = 0
+        self.wrote_token_num = 0
+        self.writing_records: Dict[str, WriteRecord] = {}
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host, initial_load_speed, self.req_to_remove,
         )
@@ -74,6 +86,9 @@ class SyncChunkCache(ChunkCache):
         self.req_write_op_count.clear()
         self.req_to_remove.clear()
         self.req_to_evict.clear()
+        self.loading_token_num = 0
+        self.write_token_num = 0
+        self.wrote_token_num = 0
         super().reset()
         self.poller = threading.Thread(target=self._poll_write_ack_queue, daemon=True)
         self.poller.start()
@@ -124,21 +139,26 @@ class SyncChunkCache(ChunkCache):
     def get_removing_reqs(self) -> List[str]:
         return list(self.req_to_remove.keys())
 
-    def _evict_device(self, req: Req, seq_len: int):
+    def _evict_device(self, req: Req, evict_len: int):
         # evict a request in device memory, but still exist in host memory
-        # first check if the request is in cache and no IO operation is ongoing
         if req.rid not in self.entries:
             raise RuntimeError(f"Request {req.rid} not in cache")
-        if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 0:
-            raise RuntimeError(f"Request {req.rid} is writing")
         if req.last_node is not None and req.last_node.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
         # evict the device memory
         entry: ChunkCacheEntry = self.entries[req.rid]
         assert entry.value is not None, f"Request {req.rid} value is None"
+        # print(f"Evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
+        if evict_len < entry.value.shape[0]: # evict part of the device memory
+            value_evict = entry.value[:evict_len]
+            self.token_to_kv_pool.free(value_evict)
+            entry.value = entry.value[evict_len:]
+            return
+        if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 1:
+            raise RuntimeError(f"Request {req.rid} is writing")
+        # evict the whole device memory, but still keep the host memory
+        # print(f"Evicting whole device memory for request {req.rid}, value shape: {entry.value.shape}")
         self.token_to_kv_pool_host.update_backup(entry.host_value)
-        # print('device indices: ', device_indices.detach().cpu().numpy())
-        # print('Available device pool size after evict: ', self.token_to_kv_pool.available_size())
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
@@ -175,10 +195,19 @@ class SyncChunkCache(ChunkCache):
         entry.value = device_indices
         entry.evicted = False
         self.loading_token_num += device_indices.shape[0]
+        self.writing_records[rid].evicted_len = 0
 
     def get_loading_workload(self) -> Tuple[int, float]:
         self.load_check()
         return self.loading_token_num, self.cache_controller.running_load_speed
+    
+    def get_writing_workload(self, rid: Optional[str] = None) -> Tuple[int, float]:
+        if rid is None:
+            return self.write_token_num - self.wrote_token_num, self.write_speed
+        record = self.writing_records.get(rid)
+        if record is None:
+            raise RuntimeError(f"Request {rid} not in writing records")
+        return max(record.last_writing_pos - self.wrote_token_num, 0), self.write_speed
     
     def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
         if self.kv_selector is None:
@@ -228,15 +257,24 @@ class SyncChunkCache(ChunkCache):
                                 entry.host_value
                             )[0]
                             self.kv_selector.post_key_cache(ack.rid, k_cache)
+                    if ack.rid in self.writing_records:
+                        record = self.writing_records[ack.rid]
+                        record_queue = record.writing_queue
+                        if not record_queue.empty():
+                            write_num = record_queue.get_nowait()
+                            self.wrote_token_num += write_num
+                            record.written_len += write_num
+                            if ack.rid in self.req_to_evict:
+                                self._evict_device(ack.req, record.written_len - record.evicted_len)
+                                record.evicted_len = record.written_len
                     self.req_write_op_count[ack.rid] -= 1
                     if self.req_write_op_count[ack.rid] == 0:
                         if ack.rid in self.req_to_evict:
-                            seq_len = self.req_to_evict[ack.rid]
                             del self.req_to_evict[ack.rid]
-                            self._evict_device(ack.req, seq_len)
                         elif ack.rid in self.req_to_remove:
                             del self.req_to_remove[ack.rid]
                             del self.req_write_op_count[ack.rid]
+                            del self.writing_records[ack.rid]
             except Empty:
                 continue
             except Exception as e:
@@ -280,6 +318,7 @@ class SyncChunkCache(ChunkCache):
         assert seq_len == entry.host_value.shape[0] + 1, \
             f"seq_len {seq_len} != host_indices {entry.host_value.shape[0]} + 1"
         if is_recompute: # directly mark the backup host memory as synced
+            self.writing_records[req.rid].evicted_len = 0
             self.token_to_kv_pool_host.update_synced(entry.host_value)
         # original cache_controller.write writes the whole request
         # so we need to modify it to write only the last token
@@ -294,6 +333,12 @@ class SyncChunkCache(ChunkCache):
         entry.value = device_indices
         entry.backuped = True
         self.req_write_op_count[req.rid] += 1
+        # writing records
+        self.write_token_num += 1
+        if req.rid in self.writing_records:
+            writing_record = self.writing_records.get(req.rid)
+            writing_record.writing_queue.put(1)
+            writing_record.last_writing_pos = self.write_token_num
     
     def _sync_prefill(self, req: Req, seq_len: int):
         # add a write operation for this one token generated in this step
@@ -318,6 +363,11 @@ class SyncChunkCache(ChunkCache):
         entry.host_value = host_indices
         entry.backuped = True
         self.req_write_op_count[req.rid] = 1
+        # writing records
+        self.write_token_num += device_indices.shape[0]
+        record = Queue()
+        record.put(device_indices.shape[0])
+        self.writing_records[req.rid] = WriteRecord(record, self.write_token_num)
 
     def sync_batch(self, batch: ScheduleBatch):
         seq_lens_cpu = batch.seq_lens.cpu()
@@ -337,21 +387,25 @@ class SyncChunkCache(ChunkCache):
                 else:
                     self._sync_decode(req, seq_lens_cpu[i])
     
-    def _initial_profile(self) -> float:
-        PROFILE_SEQ_LENGTH = 1024
-        device_indices = self.token_to_kv_pool.alloc(PROFILE_SEQ_LENGTH)
+    def _initial_profile(self) -> Tuple[float, float]:
+        PROFILE_LEN = 1024
+        device_indices = self.token_to_kv_pool.alloc(PROFILE_LEN)
         if device_indices is None:
             raise RuntimeError("Failed to allocate device memory for profiling")
-        host_indices = self.token_to_kv_pool_host.alloc(PROFILE_SEQ_LENGTH)
+        host_indices = self.token_to_kv_pool_host.alloc(PROFILE_LEN)
         if host_indices is None:
             raise RuntimeError("Failed to allocate host memory for profiling")
         data = self.token_to_kv_pool_host.get_flat_data(host_indices)
         data = data.contiguous().pin_memory()
         start_time = time.time()
         self.token_to_kv_pool.transfer(device_indices, data)
-        end_time = time.time()
+        time_load = time.time() - start_time
+        data = self.token_to_kv_pool.get_flat_data(device_indices)
+        start_time = time.time()
+        self.token_to_kv_pool_host.transfer(host_indices, data)
+        time_write = time.time() - start_time
         # free the resources
         self.token_to_kv_pool.free(device_indices)
         self.token_to_kv_pool_host.free(host_indices)
         # return the throughput
-        return PROFILE_SEQ_LENGTH / (end_time - start_time)
+        return PROFILE_LEN / time_load, PROFILE_LEN / time_write
