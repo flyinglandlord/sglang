@@ -376,12 +376,12 @@ async def async_request_sglang_generate(
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
-                                    prev_buffer = output.buffer_size[-1]
-                                    buffer_now = prev_buffer + 1 - (timestamp - most_recent_timestamp) * output.output_speed
-                                    if buffer_now > 0:
-                                        output.buffer_size.append(buffer_now)
+                                    if output.buffer_size[-1] < 0:
+                                        prev_buffer = 0
                                     else:
-                                        output.buffer_size.append(0)
+                                        prev_buffer = output.buffer_size[-1]
+                                    buffer_now = prev_buffer + 1 - (timestamp - most_recent_timestamp) * output.output_speed
+                                    output.buffer_size.append(buffer_now)
                                 most_recent_timestamp = timestamp
                                 generated_text = data["text"]
 

@@ -1358,6 +1358,8 @@ class Scheduler:
 
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                if self.cum_buffer_size is not None:
+                    del self.cum_buffer_size[req.rid]
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])

@@ -83,10 +83,12 @@ class MyScheduleDecision():
     def initialize_keep_running_list(self, available_tokens, available_requests):
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
+        self.avail_tokens -= len(self.running_reqs) * self.min_generated_num
         for req in self.running_reqs:
             if self.can_add_request(req):
                 self.add_request(req)
-        # self.avail_running_requests = available_requests
+        self.avail_running_requests = available_requests
+        self.avail_tokens = available_tokens
 
     def remove_request(self, req):
         if req not in self.keep_running_list and req not in self.new_load_list and req not in self.new_prefill_list:
@@ -152,14 +154,18 @@ class MyRequestOffloadManager():
         self.evict_queue = []
         self.evicting_queue = []
         self.sync_cache = sync_cache
+
+        self.begin_time_stamp = {}
     
     def add_load_request(self, req):
         #assert req not in self.load_queue, "Double adding the loading request"
         self.load_queue.append((req, time.time()))
+        self.begin_time_stamp[req.rid] = time.time()
     
     def add_evict_request(self, req, evict_len):
         #assert req not in self.evict_queue, "Double adding the evicting request"
         self.evict_queue.append((req, evict_len, time.time()))
+        self.begin_time_stamp[req.rid] = time.time()
 
     def get_total_reqs(self):
         return len(self.load_queue) + len(self.loading_queue) + len(self.evict_queue) + len(self.evicting_queue)
@@ -171,6 +177,9 @@ class MyRequestOffloadManager():
                 loaded_req.append(req)
         for req in loaded_req:
             self.loading_queue.remove(req)
+            print(f"{req[0].rid} with {len(req[0].origin_input_ids) + len(req[0].output_ids)} \
+                  finished load in {time.time() - self.begin_time_stamp[req[0].rid]}", file=open('tmp/offload_log.log', 'a'))
+            del self.begin_time_stamp[req[0].rid]
         res = []
         for req in loaded_req:
             res.append(req[0])
@@ -219,7 +228,7 @@ class MyRequestOffloadManager():
 
     def step(self):
         if len(self.load_queue) > 0 or len(self.evict_queue) > 0:
-            print(f"load queue: {len(self.load_queue)} evict queue: {len(self.evict_queue)}")
+            print(f"load wait queue: {len(self.load_queue)}, loading queue: {len(self.loading_queue)}, evicting queue: {len(self.evicting_queue)}", file=open('tmp/offload_log.log', 'a'))
         # NOTE: Later we can adopt more fine-grained offload strategy
         # First we deal with the evict request, only request are finished we can only do loading
         #print(f"1: {len(self.evict_queue)}, {len(self.evicting_queue)}")
@@ -236,6 +245,10 @@ class MyRequestOffloadManager():
         #print('evicting_queue len', len(new_evicting_queue))
         #print('evicting_queue', new_evicting_queue)
         finished_evict = [req[0] for req in self.evicting_queue if req[0].rid not in new_evicting_queue]
+        for req in finished_evict:
+            print(f"{req.rid} with {len(req.origin_input_ids) + len(req.output_ids)} \
+                  finished evict in {time.time() - self.begin_time_stamp[req.rid]}", file=open('tmp/offload_log.log', 'a'))
+            del self.begin_time_stamp[req.rid]
         self.evicting_queue = [req for req in self.evicting_queue if req[0].rid in new_evicting_queue]
         #print(f"3: {len(self.evict_queue)}, {len(finished_evict)} ,{len(self.evicting_queue)}")
         #print("available token slots", self.sync_cache.req_to_token_pool.available_size())
@@ -285,7 +298,7 @@ class MyScheduler(Scheduler):
         self.req_last_run_time = {}
 
         # Some custom scheduler config
-        self.high_watermark_ratio = 3.0
+        self.high_watermark_ratio = 5.0
         self.low_watermark_ratio = 1.0
         self.reschedule_interval = 1.0
         self.log_batch_status = False
@@ -347,6 +360,7 @@ class MyScheduler(Scheduler):
                     result = self.run_batch(batch)
                     #torch.cuda.synchronize()
                     ed = time.time()
+                    self.last_running_time = ed - st
                     # if batch.forward_mode.is_decode():
                     #     if self.avg_decode_time == 0.0:
                     #         self.avg_decode_time = (ed - st)
@@ -387,7 +401,8 @@ class MyScheduler(Scheduler):
                     self.cum_buffer_size[rid] = 0
 
     def estimate_load_cost(self, req):
-        return (len(req.origin_input_ids) + len(req.output_ids)) / 409600
+        loading_tokens, load_speed = self.tree_cache.get_loading_workload()
+        return (loading_tokens + len(req.origin_input_ids) + len(req.output_ids)) / load_speed
 
     def estimate_evict_cost(self, req):
         return self.estimate_load_cost(req) / 2
@@ -396,7 +411,7 @@ class MyScheduler(Scheduler):
         if len(req.output_ids) == 0:
             return 0
         else:
-            return self.estimate_load_cost(req) * 2
+            return (len(req.origin_input_ids) + len(req.output_ids)) * (0.12375879287719727 / 15388)
 
     def evaluate_objective(self, schedule_decision, value):
         total_value = 0
@@ -407,10 +422,10 @@ class MyScheduler(Scheduler):
 
         evicted_reqs = set(schedule_decision.running_reqs) - set(schedule_decision.keep_running_list)
         evicted_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in evicted_reqs]
-        estimate_evict_time = sum(evicted_tokens) / 409600
+        estimate_evict_time = sum(evicted_tokens) / 40960
 
         load_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in schedule_decision.new_load_list]
-        estimate_load_time = sum(load_tokens) / 409600
+        estimate_load_time = sum(load_tokens) / 40960
 
         prefill_tokens = [(len(req.origin_input_ids) + len(req.output_ids)) for req in schedule_decision.new_prefill_list]
         estimate_prefill_time = sum(prefill_tokens) * (0.12375879287719727 / 15388)
@@ -422,7 +437,7 @@ class MyScheduler(Scheduler):
         for req in schedule_decision.new_prefill_list:
             total_value += value.get(req, 0) * ((estimate_decode_time - estimate_evict_time - estimate_prefill_time) / estimate_decode_time)
 
-        return total_value - sum(evicted_tokens) / 40960 - max(sum(load_tokens) / 20480, sum(prefill_tokens) / 10240)
+        return total_value - estimate_evict_time - max(estimate_load_time, estimate_prefill_time)
 
     def greedy_selection(self, schedule_decision, value, candidates=None):
         # Simple greedy algorithm for request selection
@@ -441,14 +456,11 @@ class MyScheduler(Scheduler):
 
                 # 预先计算两种可能
                 if self.tree_cache.can_load_back(req):
-                    # 直接load方式
-                    load_cost = self.estimate_load_cost(req)
-                    adjusted_value_load = v - load_cost
+                    adjusted_value_load = v
                     candidates.append((req, adjusted_value_load, size, 'waiting', False))  # recompute=False
                 
                 # prefilling方式
-                recompute_cost = self.estimate_recompute_cost(req)
-                adjusted_value_recompute = v - recompute_cost
+                adjusted_value_recompute = v
                 candidates.append((req, adjusted_value_recompute, size, 'waiting', True))  # recompute=True
 
             # 按 adjusted value 排序，性价比高的优先
@@ -513,15 +525,16 @@ class MyScheduler(Scheduler):
             for req in self.waiting_queue:
                 assert req.rid in self.cum_buffer_size, \
                     "Request not in cum_buffer_size, but it should be added when the request is received."
-                valid_thr[req] = \
-                    (self.cum_buffer_size[req.rid] - min(self.estimate_load_cost(req), self.estimate_evict_cost(req)) * self.output_speed[req.rid]) * \
-                    (self.reschedule_interval - min(self.estimate_load_cost(req), self.estimate_evict_cost(req)))
+                final_buffer_size = self.cum_buffer_size[req.rid] - \
+                    min(self.estimate_load_cost(req), self.estimate_recompute_cost(req)) * self.output_speed[req.rid]
+                if final_buffer_size < -5: final_buffer_size = -5
+                valid_thr[req] = math.exp(-final_buffer_size) * self.reschedule_interval
         
         if self.running_batch is not None:
             for req in self.running_batch.reqs:
                 assert req.rid in self.cum_buffer_size, \
                     "Request not in cum_buffer_size, but it should be added when the request is received."
-                valid_thr[req] = self.cum_buffer_size[req.rid] * self.reschedule_interval
+                valid_thr[req] = math.exp(-self.cum_buffer_size[req.rid]) * self.reschedule_interval
         
         return valid_thr
     
@@ -534,69 +547,34 @@ class MyScheduler(Scheduler):
                                             self.max_running_requests, self.max_prefill_tokens, self.new_token_ratio)
 
         schedule_decision.initialize_keep_running_list(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size())
+        self.greedy_selection(schedule_decision, valid_thr)
+        
 
-        # filter_for_overflow_buffer = []
-        # for req in schedule_decision.keep_running_list:
-        #     if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * self.high_watermark_ratio:
-        #         filter_for_overflow_buffer.append(req)
-        # for req in filter_for_overflow_buffer:
-        #     schedule_decision.remove_request(req)
+        if len(self.waiting_queue) > 0:
+            running_queue_evict_candidate = []
+            waiting_queue_run_candidate = []
+            for req in schedule_decision.keep_running_list:
+                running_queue_evict_candidate.append(req)
+            for req in self.waiting_queue:
+                waiting_queue_run_candidate.append((req, 0, 0, "waiting", True))
+            
+            running_queue_evict_candidate = sorted(running_queue_evict_candidate, key=lambda x: (-valid_thr[x]))
+            waiting_queue_run_candidate = sorted(waiting_queue_run_candidate, key=lambda x: (self.output_speed[x[0].rid], -valid_thr[x[0]]))
 
-        # First, we check if the result satisfied the QoS standard to get next batch size
-        # next_running_batch_size = len(schedule_decision.keep_running_list)
-        # if self.last_running_time is not None and next_running_batch_size != 0 and not self.last_batch.forward_mode.is_extend():
-        #     last_schedule_thr = 1.0 / self.last_running_time
-        #     satisfied = True
-        #     for req in schedule_decision.keep_running_list:
-        #         if last_schedule_thr < self.output_speed[req.rid]:
-        #             satisfied = False
-        #     if satisfied:
-        #         next_running_batch_size = min(int(len(schedule_decision.keep_running_list) * 1.1), self.max_running_requests)
-        #     else:
-        #         next_running_batch_size = int(len(schedule_decision.keep_running_list) * 0.9)
-        # else:
-        #     next_running_batch_size = self.max_running_requests
-        next_running_batch_size = self.max_running_requests
+            running_queue_evict_candidate = running_queue_evict_candidate[-2:]
+            for req in running_queue_evict_candidate:
+                schedule_decision.remove_request(req)
 
-        # Second, we sort the keep_running_list to get the possible evictable requests
-        # These request are the last 40% in the keep_running_list
-        evictable_reqs = []
-        evictable_cnt = int(len(schedule_decision.keep_running_list) * 0.4)
-        for req in schedule_decision.keep_running_list:
-            evictable_reqs.append((req, valid_thr[req], self.req_last_run_time[req.rid]))
-        evictable_reqs = sorted(evictable_reqs, key=lambda x: (-x[1], -x[2]))
-        evictable_reqs = evictable_reqs[-evictable_cnt:]
-        for req in evictable_reqs:
-            schedule_decision.remove_request(req[0])
+            self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
 
-        # Third, trade-off the evictable_reqs with reqs in the waiting queue
-        # Using the objective function defined above
-        budget_reqs_num = next_running_batch_size - (len(schedule_decision.keep_running_list) - len(evictable_reqs))
-        io_reqs_num = self.offload_manager.get_total_reqs()
-        if budget_reqs_num <= 0:
-            return schedule_decision
-        # self.offload_manager.avail_running_requests = budget_reqs_num
-        budget_candidate = []
-        for req in evictable_reqs:
-            size = len(req[0].origin_input_ids) + len(req[0].output_ids) + max(self.output_speed[req[0].rid] - self.cum_buffer_size[req[0].rid], 0)
-            budget_candidate.append((req[0], valid_thr[req[0]], size, 'running', False))
-        for req in self.waiting_queue:
-            size = len(req.origin_input_ids) + len(req.output_ids) + max(self.output_speed[req.rid] - self.cum_buffer_size[req.rid], 0)
-            if self.tree_cache.can_load_back(req):
-                budget_candidate.append((req, 
-                    valid_thr[req], #* (1 - io_reqs_num/self.max_running_requests * 0.01) - self.estimate_load_cost(req) * 0.01, 
-                    size, 'waiting', False))
-            budget_candidate.append((req, 
-                valid_thr[req], #- self.estimate_recompute_cost(req) * 0.01, 
-                size, 'waiting', True))
-        # print(budget_candidate)
-        budget_candidate = budget_candidate.sort(key=lambda x: (-x[1]))
-        self.greedy_selection(schedule_decision, valid_thr, budget_candidate)
-        # self.local_search(schedule_decision, valid_thr)
+        print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
+        for req in valid_thr.keys():
+            print(f'({req.rid}, {self.estimate_load_cost(req)}, {req in schedule_decision.keep_running_list})', end=' ', file=open('tmp/buffer_size.log', 'a'))
+        print('', file=open('tmp/buffer_size.log', 'a'))
 
         # DEBUG: Print the detail of schedule decision to log
         print('keep_running_list', schedule_decision.keep_running_list, file=open('tmp/schedule_output.txt', "a"))
-        print(len(schedule_decision.keep_running_list), len(schedule_decision.running_reqs), file=open('tmp/schedule_output.txt', "a"))
+        print(len(schedule_decision.keep_running_list), file=open('tmp/schedule_output.txt', "a"))
         print('new_load_list', schedule_decision.new_load_list, file=open('tmp/schedule_output.txt', "a"))
         print(len(schedule_decision.new_load_list), file=open('tmp/schedule_output.txt', "a"))
         print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
@@ -693,7 +671,7 @@ class MyScheduler(Scheduler):
                 ret = self.next_prefill_batch
                 self.next_prefill_batch = None
                 ret.prepare_for_extend()
-
+                # print(f"prefill now!")
                 # update request last run time
                 for req in ret.reqs:
                     self.req_last_run_time[req.rid] = time.time()
@@ -705,10 +683,7 @@ class MyScheduler(Scheduler):
                 before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
             else:
                 before_req_nums = len(self.waiting_queue) + self.offload_manager.get_total_reqs()
-            # print(self.cum_buffer_size, file=open('tmp/buffer_size.log', 'a'))
-            if self.running_batch is not None:
-                print('before_req_nums', before_req_nums)
-                print(self.req_to_token_pool.available_size(), len(self.running_batch.reqs))
+            print('cum_buffer_size', self.cum_buffer_size, file=open('tmp/buffer_size.log', 'a'))
             self.schedule_decision = self.generate_schedule_decision()
             
             if len(self.schedule_decision.new_prefill_list) == 0 and len(self.schedule_decision.keep_running_list) == 0 and len(self.schedule_decision.new_load_list) == 0:
@@ -727,7 +702,7 @@ class MyScheduler(Scheduler):
                 for i, req in enumerate(evict_list):
                     idx = self.running_batch.reqs.index(req)
                     if isinstance(self.tree_cache, SyncChunkCache):
-                        print(f'evict {req.rid} for {seq_lens_cpu[idx]} tokens')
+                        # print(f'evict {req.rid} for {seq_lens_cpu[idx]} tokens')
                         self.offload_manager.add_evict_request(req, seq_lens_cpu[idx])
                     elif isinstance(self.tree_cache, ChunkCache):
                         # ChunkCache directly evict all tokens
@@ -765,7 +740,6 @@ class MyScheduler(Scheduler):
                 ]
                 # second we deal with the load process
                 for i, req in enumerate(self.schedule_decision.new_load_list):
-                    print(f"loading {req.rid}")
                     self.offload_manager.add_load_request(req)
                 # print('req_to_token_pool', self.req_to_token_pool.available_size(), '/', self.req_to_token_pool.size)
                 self.waiting_queue.extend(self.offload_manager.step())
@@ -784,7 +758,6 @@ class MyScheduler(Scheduler):
                         req.reset_for_retract()
                         # self.tree_cache.remove_req(req)
                     req.init_next_round_input(None)
-                    # print(f"prefill {req.rid}")
                 
                 # else, we have to do recompute
                 self.next_prefill_batch = ScheduleBatch.init_new(
@@ -804,6 +777,7 @@ class MyScheduler(Scheduler):
                     ret = self.next_prefill_batch
                     self.next_prefill_batch = None
                     try:
+                        # print(f"prefill now!")
                         ret.prepare_for_extend()
                     except Exception as e:
                         print(ret.reqs)
