@@ -23,22 +23,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
-@dataclass
-class WriteRecord:
-    writing_queue: Queue[int]
-    last_writing_pos: int
-    evicted_len: int = 0
-    written_len: int = 0
+class SyncCacheEntry(ChunkCacheEntry):
+    def __init__(self, rid: str, value: torch.Tensor):
+        super().__init__(rid, value)
+        self.last_writing_pos: int = 0
+        self.evicted_len: int = 0
+        self.written_len: int = 0
+        self.is_synced: bool = True
 
 class SyncChunkCache(ChunkCache):
     def __init__(
         self, 
-        req_to_token_pool: ReqToTokenPool, 
+        req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: MHATokenToKVPool,
+        sync_chunk_size: int = 64,
     ):
         assert isinstance(token_to_kv_pool, MHATokenToKVPool), \
             f"token_to_kv_pool must be MHATokenToKVPool, but got {type(req_to_token_pool)}"
-        self.req_write_op_count = {}
         self.req_to_remove: Dict[str, Optional[List[int]]] = {}
         self.req_to_evict: Dict[str, int] = {}
         self.kv_selector: Optional[KVSelector] = None
@@ -50,13 +51,14 @@ class SyncChunkCache(ChunkCache):
         self.loading_token_num = 0
         self.write_token_num = 0
         self.wrote_token_num = 0
-        self.writing_records: Dict[str, WriteRecord] = {}
+        self.writing_records: Dict[str, Queue[int]] = {}
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host, initial_load_speed, self.req_to_remove,
         )
         self.stop_event = threading.Event()
         self.entries_lock = threading.Lock()
         self.poller = threading.Thread(target=self._poll_write_ack_queue, daemon=True)
+        self.sync_chunk_size = sync_chunk_size
         super().__init__(req_to_token_pool, token_to_kv_pool)
 
     def init_kv_selector(self) -> Optional[KVSelector]:
@@ -83,9 +85,9 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector.reset()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
-        self.req_write_op_count.clear()
         self.req_to_remove.clear()
         self.req_to_evict.clear()
+        self.writing_records.clear()
         self.loading_token_num = 0
         self.write_token_num = 0
         self.wrote_token_num = 0
@@ -96,13 +98,11 @@ class SyncChunkCache(ChunkCache):
     def _cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         # free host memory
         if req.rid in self.entries:
-            entry: ChunkCacheEntry = self.entries[req.rid]
+            entry: SyncCacheEntry = self.entries[req.rid]
             if entry.host_value is not None:
                 self.token_to_kv_pool_host.free(entry.host_value)
                 entry.host_value = None
                 entry.host_req_pool_idx = None
-            if self.req_write_op_count[req.rid] == 0:
-                del self.req_write_op_count[req.rid]
         else: 
             print(f"WARNING: Request {req.rid} finished right after prefill")
         # then call base class to free device memory
@@ -119,16 +119,19 @@ class SyncChunkCache(ChunkCache):
         # since we write kv cache to cpu memory in a separate thread.
         # The cache will finally be remove when polling the write ack queue.
         with self.entries_lock:
-            if self.req_write_op_count.get(req.rid, 0) == 0:
+            if self.writing_records[req.rid].empty():
                 self._cache_finished_req(req, token_ids)
+                del self.writing_records[req.rid]
             self.req_to_remove[req.rid] = token_ids
         if self.kv_selector is not None:
             self.kv_selector.req_finished(req.rid)
 
     def evict_device(self, req: Req, seq_len: int):
         # NOTE: Also asynchronized way to evict device memory
+        assert req.rid in self.entries, f"Request {req.rid} not in cache"
         with self.entries_lock:
-            if self.req_write_op_count.get(req.rid, 0) > 0:
+            self._write_host(self.entries[req.rid], req, True)
+            if req.rid in self.writing_records and not self.writing_records[req.rid].empty():
                 self.req_to_evict[req.rid] = seq_len
             else: # evict the request immediately
                 self._evict_device(req, seq_len)
@@ -146,7 +149,7 @@ class SyncChunkCache(ChunkCache):
         if req.last_node is not None and req.last_node.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
         # evict the device memory
-        entry: ChunkCacheEntry = self.entries[req.rid]
+        entry: SyncCacheEntry = self.entries[req.rid]
         assert entry.value is not None, f"Request {req.rid} value is None"
         # print(f"Evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
         if evict_len < entry.value.shape[0]: # evict part of the device memory
@@ -154,11 +157,12 @@ class SyncChunkCache(ChunkCache):
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
             return
-        if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 1:
+        if not self.writing_records[req.rid].empty():
             raise RuntimeError(f"Request {req.rid} is writing")
         # evict the whole device memory, but still keep the host memory
         # print(f"Evicting whole device memory for request {req.rid}, value shape: {entry.value.shape}")
-        self.token_to_kv_pool_host.update_backup(entry.host_value)
+        if entry.is_synced:
+            self.token_to_kv_pool_host.update_backup(entry.host_value)
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
@@ -171,14 +175,14 @@ class SyncChunkCache(ChunkCache):
         with self.entries_lock:
             if rid not in self.entries:
                 raise RuntimeError(f"Request {rid} not in cache")
-            entry: ChunkCacheEntry = self.entries[rid]
+            entry: SyncCacheEntry = self.entries[rid]
             if not entry.backuped:
                 raise RuntimeError(f"Request {rid} not backuped")
             if entry.host_value is None:
                 raise RuntimeError(f"Host value is None for rid {rid}")
             if entry.loading:
                 raise RuntimeError(f"Request {rid} is loading")
-            if rid in self.req_write_op_count and self.req_write_op_count[rid] > 0:
+            if not self.writing_records[req.rid].empty():
                 raise RuntimeError(f"Request {rid} is writing")
         # allocate device memory
         host_value = entry.host_value
@@ -194,8 +198,8 @@ class SyncChunkCache(ChunkCache):
         entry.loading = True
         entry.value = device_indices
         entry.evicted = False
+        entry.evicted_len = 0
         self.loading_token_num += device_indices.shape[0]
-        self.writing_records[rid].evicted_len = 0
 
     def get_loading_workload(self) -> Tuple[int, float]:
         self.load_check()
@@ -204,10 +208,10 @@ class SyncChunkCache(ChunkCache):
     def get_writing_workload(self, rid: Optional[str] = None) -> Tuple[int, float]:
         if rid is None:
             return self.write_token_num - self.wrote_token_num, self.write_speed
-        record = self.writing_records.get(rid)
-        if record is None:
-            raise RuntimeError(f"Request {rid} not in writing records")
-        return max(record.last_writing_pos - self.wrote_token_num, 0), self.write_speed
+        if rid not in self.entries:
+            raise RuntimeError(f"Request {rid} not in cache")
+        entry: SyncCacheEntry = self.entries[rid]
+        return max(entry.last_writing_pos - self.wrote_token_num, 0), self.write_speed
     
     def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
         if self.kv_selector is None:
@@ -246,34 +250,32 @@ class SyncChunkCache(ChunkCache):
             try:
                 ack = self.cache_controller.ack_write_queue.get(timeout=1)
                 with self.entries_lock:
-                    entry: ChunkCacheEntry = self.entries.get(ack.rid)
+                    entry: SyncCacheEntry = self.entries.get(ack.rid)
+                    assert ack.rid in self.writing_records, \
+                        f"Request {ack.rid} not in writing records"
+                    record = self.writing_records[ack.rid]
+                    write_num = record.get_nowait()
+                    self.wrote_token_num += write_num
                     if entry is not None:
                         if ack.rid in self.req_to_remove:
                             if not self.cache_controller.is_writing(ack.rid):
                                 token_ids = self.req_to_remove[ack.rid]
                                 self._cache_finished_req(ack.req, token_ids)
-                        elif self.kv_selector is not None:
-                            k_cache = self.token_to_kv_pool_host.get_flat_data(
-                                entry.host_value
-                            )[0]
-                            self.kv_selector.post_key_cache(ack.rid, k_cache)
-                    if ack.rid in self.writing_records:
-                        record = self.writing_records[ack.rid]
-                        record_queue = record.writing_queue
-                        if not record_queue.empty():
-                            write_num = record_queue.get_nowait()
-                            self.wrote_token_num += write_num
-                            record.written_len += write_num
-                            if ack.rid in self.req_to_evict:
-                                self._evict_device(ack.req, record.written_len - record.evicted_len)
-                                record.evicted_len = record.written_len
-                    self.req_write_op_count[ack.rid] -= 1
-                    if self.req_write_op_count[ack.rid] == 0:
+                        else:
+                            entry.written_len += write_num
+                            if entry.rid in self.req_to_evict:
+                                self._evict_device(ack.req, entry.written_len - entry.evicted_len)
+                                entry.evicted_len = entry.written_len
+                            if self.kv_selector is not None:
+                                k_cache = self.token_to_kv_pool_host.get_flat_data(
+                                    entry.host_value
+                                )[0]
+                                self.kv_selector.post_key_cache(ack.rid, k_cache)
+                    if record.empty():
                         if ack.rid in self.req_to_evict:
                             del self.req_to_evict[ack.rid]
                         elif ack.rid in self.req_to_remove:
                             del self.req_to_remove[ack.rid]
-                            del self.req_write_op_count[ack.rid]
                             del self.writing_records[ack.rid]
             except Empty:
                 continue
@@ -284,90 +286,122 @@ class SyncChunkCache(ChunkCache):
         # check if the request can be loaded back
         if req.rid not in self.entries:
             return False
-        entry: ChunkCacheEntry = self.entries[req.rid]
+        entry: SyncCacheEntry = self.entries[req.rid]
         if entry.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
-        return entry.host_value is not None
+        return entry.host_value is not None and entry.is_synced
 
     def wait_write(self, req: Req):
         # [deprecated] wait for a certain request to finish writing
         if req.rid not in self.entries:
             raise RuntimeError(f"Request {req.rid} not in cache")
-        if req.rid not in self.req_write_op_count:
+        if req.rid not in self.writing_records:
             raise RuntimeError(f"Request {req.rid} not in write op count")
+        record = self.writing_records[req.rid]
         start_time = time.time()
-        while self.req_write_op_count[req.rid] > 0:
+        while not record.empty():
             time.sleep(1e-4)
             if time.time() - start_time > 5:
-                print(self.req_write_op_count)
+                print(self.writing_records)
                 raise RuntimeError(f"Request {req.rid} write op timeout")
+    
+    def _write_host(self, entry: SyncCacheEntry, req: Req, force_write: bool = False):
+        is_prefill = entry.host_value is None
+        if is_prefill:
+            device_indices = entry.value
+            sync_len = int(device_indices.shape[0])
+        else:
+            host_len = entry.host_value.shape[0]
+            sync_len = entry.value.shape[0] - host_len
+            if sync_len == 0:
+                return # no need to write
+            if not force_write and sync_len < self.sync_chunk_size:
+                return # wait for more tokens to write
+            device_indices = entry.value[host_len: host_len + sync_len]
+        host_indices = self.cache_controller.write(device_indices, node_id=entry)
+        if host_indices is None:
+            raise RuntimeError("Failed to allocate host memory for backup")
+        if is_prefill:
+            assert entry.host_value is None, \
+                f"Request {req.rid} host value is not None, {entry.host_value.shape}"
+        else:
+            host_indices = torch.cat([entry.host_value, host_indices], dim=0)
+        entry.host_value = host_indices
+        self.write_token_num += sync_len
+        entry.backuped = True
+        entry.last_writing_pos = self.write_token_num
+        if is_prefill:
+            record = Queue()
+            record.put(sync_len)
+            self.writing_records[req.rid] = record
+        else:
+            self.writing_records[req.rid].put(sync_len)
 
     def _sync_decode(self, req: Req, seq_len: int, is_recompute: bool = False):
         # add a write operation for this one token generated in this step
         if req.rid not in self.entries:
             # print(f"WARNING: Request {req.rid} not in cache")
             return # scheduler will remove request before the my_scheduler call this
-        entry: ChunkCacheEntry = self.entries[req.rid]
+        entry: SyncCacheEntry = self.entries[req.rid]
         if is_recompute and not entry.evicted:
             raise RuntimeError(f"Request {req.rid} not evicted, recompute is not allowed")
-        if entry.host_value is None:
-            raise RuntimeError(f"Host value is None for rid {req.rid}")
-        host_indices = self.token_to_kv_pool_host.alloc(1)
-        if host_indices is None:
-            raise RuntimeError("Failed to allocate host memory for backup")
-        assert seq_len == entry.host_value.shape[0] + 1, \
-            f"seq_len {seq_len} != host_indices {entry.host_value.shape[0]} + 1"
-        if is_recompute: # directly mark the backup host memory as synced
-            self.writing_records[req.rid].evicted_len = 0
-            self.token_to_kv_pool_host.update_synced(entry.host_value)
-        # original cache_controller.write writes the whole request
-        # so we need to modify it to write only the last token
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : seq_len
         ]
-        self.token_to_kv_pool_host.protect_write(host_indices)
-        self.cache_controller.write_queue.put(
-            CacheOperation(host_indices, device_indices[-1:], entry)
-        )
-        entry.host_value = torch.cat([entry.host_value, host_indices], dim=0)
         entry.value = device_indices
-        entry.backuped = True
-        self.req_write_op_count[req.rid] += 1
-        # writing records
-        self.write_token_num += 1
-        if req.rid in self.writing_records:
-            writing_record = self.writing_records.get(req.rid)
-            writing_record.writing_queue.put(1)
-            writing_record.last_writing_pos = self.write_token_num
+        if entry.is_synced:
+            if is_recompute:
+                entry.evicted = False
+                entry.evicted_len = 0
+                self.token_to_kv_pool_host.update_synced(entry.host_value)
+            assert entry.host_value is not None, \
+                f"Request {req.rid} host value is None, {entry.host_value.shape}"
+            self._write_host(entry, req)
     
     def _sync_prefill(self, req: Req, seq_len: int):
         # add a write operation for this one token generated in this step
         if req.rid in self.entries:
             # recomputing a request is the same as decoding
             return self._sync_decode(req, seq_len, True)
-        if req.rid in self.req_write_op_count and self.req_write_op_count[req.rid] > 0:
+        if req.rid in self.writing_records and not self.writing_records[req.rid].empty():
             raise RuntimeError(f"Request {req.rid} already in write op count")
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : seq_len
         ]
-        entry = ChunkCacheEntry(req.rid, device_indices)
+        entry = SyncCacheEntry(req.rid, device_indices)
         self.entries[req.rid] = entry
-        entry.value = device_indices
         entry.req = req
         req.last_node = entry
-        host_indices = self.cache_controller.write(
-            device_indices=device_indices, node_id=entry
-        )
-        if host_indices is None:
-            raise RuntimeError("Failed to allocate host memory for backup")
-        entry.host_value = host_indices
-        entry.backuped = True
-        self.req_write_op_count[req.rid] = 1
-        # writing records
-        self.write_token_num += device_indices.shape[0]
-        record = Queue()
-        record.put(device_indices.shape[0])
-        self.writing_records[req.rid] = WriteRecord(record, self.write_token_num)
+        if self._is_writing_overloaded(0.01):
+            print(f"WARNING: delay writing {req.rid}")
+            entry.is_synced = False
+            self.writing_records[req.rid] = Queue()
+        else:
+            self._write_host(entry, req)
+    
+    def sync_unsynced_reqs(self):
+        """Tries to synchronize unsynchronized requests."""
+        with self.entries_lock:
+            unsynced_entries = [
+                entry for entry in self.entries.values() 
+                if (
+                    not entry.is_synced and
+                    entry.value is not None and
+                    entry.rid not in self.req_to_remove and
+                    entry.rid not in self.req_to_evict
+                )
+            ]
+            # sort the requests by their sequence length
+            unsynced_entries.sort(key=lambda x: x.value.shape[0])
+            for entry in unsynced_entries:
+                if self._is_writing_overloaded():
+                    break
+                print(f"INFO: try to synchronize {entry.rid} len: {entry.value.shape[0]}")
+                self._write_host(entry, entry.req)
+                entry.is_synced = True
+
+    def _is_writing_overloaded(self, threshold: float = 0.02) -> bool:
+        return self.write_token_num - self.wrote_token_num > threshold * self.write_speed
 
     def sync_batch(self, batch: ScheduleBatch):
         seq_lens_cpu = batch.seq_lens.cpu()
@@ -376,16 +410,18 @@ class SyncChunkCache(ChunkCache):
         with self.entries_lock:
             for i, req in enumerate(batch.reqs):
                 if req.rid in self.req_to_remove:
-                    op_count = self.req_write_op_count.get(req.rid)
-                    if op_count is None or op_count == 0:
+                    record = self.writing_records.get(req.rid)
+                    if record is None or self.writing_records[req.rid].empty():
                         del self.req_to_remove[req.rid]
-                        if op_count is not None:
-                            del self.req_write_op_count[req.rid]
+                        if record is not None:
+                            del self.writing_records[req.rid]
                     continue
                 if batch.forward_mode.is_extend():
                     self._sync_prefill(req, seq_lens_cpu[i])
                 else:
                     self._sync_decode(req, seq_lens_cpu[i])
+        # try to sync the unsynced requests
+        self.sync_unsynced_reqs()
     
     def _initial_profile(self) -> Tuple[float, float]:
         PROFILE_LEN = 1024
