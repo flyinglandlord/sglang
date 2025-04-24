@@ -119,9 +119,11 @@ class SyncChunkCache(ChunkCache):
         # since we write kv cache to cpu memory in a separate thread.
         # The cache will finally be remove when polling the write ack queue.
         with self.entries_lock:
-            if self.writing_records[req.rid].empty():
+            record = self.writing_records.get(req.rid)
+            if record is None or record.empty():
                 self._cache_finished_req(req, token_ids)
-                del self.writing_records[req.rid]
+                if record is not None:
+                    del self.writing_records[req.rid]
             self.req_to_remove[req.rid] = token_ids
         if self.kv_selector is not None:
             self.kv_selector.req_finished(req.rid)
@@ -153,6 +155,7 @@ class SyncChunkCache(ChunkCache):
         assert entry.value is not None, f"Request {req.rid} value is None"
         # print(f"Evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
         if evict_len < entry.value.shape[0]: # evict part of the device memory
+            print(f"partially evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
             value_evict = entry.value[:evict_len]
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
@@ -349,13 +352,12 @@ class SyncChunkCache(ChunkCache):
             req.req_pool_idx, : seq_len
         ]
         entry.value = device_indices
-        if entry.is_synced:
-            if is_recompute:
-                entry.evicted = False
-                entry.evicted_len = 0
+        if is_recompute:
+            entry.evicted = False
+            entry.evicted_len = 0
+            if entry.host_value is not None:
                 self.token_to_kv_pool_host.update_synced(entry.host_value)
-            assert entry.host_value is not None, \
-                f"Request {req.rid} host value is None, {entry.host_value.shape}"
+        if entry.is_synced:
             self._write_host(entry, req)
     
     def _sync_prefill(self, req: Req, seq_len: int):
@@ -373,7 +375,7 @@ class SyncChunkCache(ChunkCache):
         entry.req = req
         req.last_node = entry
         if self._is_writing_overloaded(0.01):
-            print(f"WARNING: delay writing {req.rid}")
+            # print(f"WARNING: delay writing {req.rid}")
             entry.is_synced = False
             self.writing_records[req.rid] = Queue()
         else:
@@ -396,7 +398,7 @@ class SyncChunkCache(ChunkCache):
             for entry in unsynced_entries:
                 if self._is_writing_overloaded():
                     break
-                print(f"INFO: try to synchronize {entry.rid} len: {entry.value.shape[0]}")
+                # print(f"INFO: try to synchronize {entry.rid} len: {entry.value.shape[0]}")
                 self._write_host(entry, entry.req)
                 entry.is_synced = True
 
