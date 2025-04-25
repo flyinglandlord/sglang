@@ -29,6 +29,7 @@ class SyncCacheEntry(ChunkCacheEntry):
         self.last_writing_pos: int = 0
         self.evicted_len: int = 0
         self.written_len: int = 0
+        self.seq_len: int = 0
         self.is_synced: bool = True
 
 class SyncChunkCache(ChunkCache):
@@ -40,7 +41,7 @@ class SyncChunkCache(ChunkCache):
     ):
         assert isinstance(token_to_kv_pool, MHATokenToKVPool), \
             f"token_to_kv_pool must be MHATokenToKVPool, but got {type(req_to_token_pool)}"
-        self.req_to_remove: Dict[str, Optional[List[int]]] = {}
+        self.req_to_remove: Set[str] = set()
         self.req_to_evict: Dict[str, int] = {}
         self.kv_selector: Optional[KVSelector] = None
         self.token_to_kv_pool = token_to_kv_pool
@@ -48,6 +49,7 @@ class SyncChunkCache(ChunkCache):
         # data fields for loading and writing profilers
         initial_load_speed, self.write_speed = self._initial_profile()
         print(f"Initial load speed: {initial_load_speed:.2f} tokens/s, write speed: {self.write_speed:.2f} tokens/s")
+        self.write_buffer_size = 2048
         self.loading_token_num = 0
         self.write_token_num = 0
         self.wrote_token_num = 0
@@ -95,7 +97,7 @@ class SyncChunkCache(ChunkCache):
         self.poller = threading.Thread(target=self._poll_write_ack_queue, daemon=True)
         self.poller.start()
 
-    def _cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
+    def _cache_finished_req(self, req: Req):
         # free host memory
         if req.rid in self.entries:
             entry: SyncCacheEntry = self.entries[req.rid]
@@ -103,10 +105,10 @@ class SyncChunkCache(ChunkCache):
                 self.token_to_kv_pool_host.free(entry.host_value)
                 entry.host_value = None
                 entry.host_req_pool_idx = None
+            del self.entries[req.rid]
         else: 
             print(f"WARNING: Request {req.rid} finished right after prefill")
         # then call base class to free device memory
-        super().cache_finished_req(req, token_ids)
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         pass # override to do nothing, the functionality is moved to sync_prefill and sync_decode
@@ -115,16 +117,22 @@ class SyncChunkCache(ChunkCache):
         assert False, "remove_req is not supported in SyncChunkCache"
 
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        # NOTE: We must use this asynchronized way to remove finished requests
-        # since we write kv cache to cpu memory in a separate thread.
-        # The cache will finally be remove when polling the write ack queue.
+        if token_ids is None:
+            token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        else:
+            token_id_len = len(token_ids)
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :token_id_len
+        ]
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.token_to_kv_pool.free(kv_indices)
         with self.entries_lock:
             record = self.writing_records.get(req.rid)
             if record is None or record.empty():
-                self._cache_finished_req(req, token_ids)
+                self._cache_finished_req(req)
                 if record is not None:
                     del self.writing_records[req.rid]
-            self.req_to_remove[req.rid] = token_ids
+            self.req_to_remove.add(req.rid)
         if self.kv_selector is not None:
             self.kv_selector.req_finished(req.rid)
 
@@ -142,7 +150,7 @@ class SyncChunkCache(ChunkCache):
         return list(self.req_to_evict.keys())
     
     def get_removing_reqs(self) -> List[str]:
-        return list(self.req_to_remove.keys())
+        return list(self.req_to_remove)
 
     def _evict_device(self, req: Req, evict_len: int):
         # evict a request in device memory, but still exist in host memory
@@ -155,7 +163,7 @@ class SyncChunkCache(ChunkCache):
         assert entry.value is not None, f"Request {req.rid} value is None"
         # print(f"Evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
         if evict_len < entry.value.shape[0]: # evict part of the device memory
-            print(f"partially evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
+            # print(f"partially evicting {evict_len} tokens from request {req.rid}, value shape: {entry.value.shape}")
             value_evict = entry.value[:evict_len]
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
@@ -251,7 +259,7 @@ class SyncChunkCache(ChunkCache):
     def _poll_write_ack_queue(self):
         while not self.stop_event.is_set():
             try:
-                ack = self.cache_controller.ack_write_queue.get(timeout=1)
+                ack = self.cache_controller.ack_write_queue.get(timeout=0.1)
                 with self.entries_lock:
                     entry: SyncCacheEntry = self.entries.get(ack.rid)
                     assert ack.rid in self.writing_records, \
@@ -262,8 +270,7 @@ class SyncChunkCache(ChunkCache):
                     if entry is not None:
                         if ack.rid in self.req_to_remove:
                             if not self.cache_controller.is_writing(ack.rid):
-                                token_ids = self.req_to_remove[ack.rid]
-                                self._cache_finished_req(ack.req, token_ids)
+                                self._cache_finished_req(ack.req)
                         else:
                             entry.written_len += write_num
                             if entry.rid in self.req_to_evict:
@@ -278,10 +285,10 @@ class SyncChunkCache(ChunkCache):
                         if ack.rid in self.req_to_evict:
                             del self.req_to_evict[ack.rid]
                         elif ack.rid in self.req_to_remove:
-                            del self.req_to_remove[ack.rid]
+                            self.req_to_remove.remove(ack.rid)
                             del self.writing_records[ack.rid]
             except Empty:
-                continue
+                self.sync_unsynced_reqs()
             except Exception as e:
                 raise e
 
@@ -313,13 +320,19 @@ class SyncChunkCache(ChunkCache):
         if is_prefill:
             device_indices = entry.value
             sync_len = int(device_indices.shape[0])
+            if not force_write and sync_len > self.write_buffer_size:
+                sync_len = self.write_buffer_size
+                device_indices = device_indices[:sync_len]
         else:
             host_len = entry.host_value.shape[0]
             sync_len = entry.value.shape[0] - host_len
             if sync_len == 0:
                 return # no need to write
-            if not force_write and sync_len < self.sync_chunk_size:
-                return # wait for more tokens to write
+            if not force_write:
+                if sync_len < self.sync_chunk_size:
+                    return # wait for more tokens
+                if sync_len > self.write_buffer_size:
+                    sync_len = self.write_buffer_size
             device_indices = entry.value[host_len: host_len + sync_len]
         host_indices = self.cache_controller.write(device_indices, node_id=entry)
         if host_indices is None:
@@ -374,7 +387,7 @@ class SyncChunkCache(ChunkCache):
         self.entries[req.rid] = entry
         entry.req = req
         req.last_node = entry
-        if self._is_writing_overloaded(0.01):
+        if self._is_writing_overloaded():
             # print(f"WARNING: delay writing {req.rid}")
             entry.is_synced = False
             self.writing_records[req.rid] = Queue()
@@ -402,28 +415,29 @@ class SyncChunkCache(ChunkCache):
                 self._write_host(entry, entry.req)
                 entry.is_synced = True
 
-    def _is_writing_overloaded(self, threshold: float = 0.02) -> bool:
+    def _is_writing_overloaded(self, threshold: float = 1.) -> bool:
         return self.write_token_num - self.wrote_token_num > threshold * self.write_speed
 
     def sync_batch(self, batch: ScheduleBatch):
-        seq_lens_cpu = batch.seq_lens.cpu()
         if self.kv_selector is not None:
             self.kv_selector.update_with_batch(batch, self.req_to_remove)
         with self.entries_lock:
+            is_extend = batch.forward_mode.is_extend()
+            seq_lens = batch.seq_lens_cpu
             for i, req in enumerate(batch.reqs):
                 if req.rid in self.req_to_remove:
                     record = self.writing_records.get(req.rid)
                     if record is None or self.writing_records[req.rid].empty():
-                        del self.req_to_remove[req.rid]
+                        self.req_to_remove.remove(req.rid)
                         if record is not None:
                             del self.writing_records[req.rid]
                     continue
-                if batch.forward_mode.is_extend():
-                    self._sync_prefill(req, seq_lens_cpu[i])
+                if is_extend:
+                    self._sync_prefill(req, seq_lens[i])
                 else:
-                    self._sync_decode(req, seq_lens_cpu[i])
-        # try to sync the unsynced requests
-        self.sync_unsynced_reqs()
+                    self._sync_decode(req, seq_lens[i])
+        if not self._is_writing_overloaded():
+            self.sync_unsynced_reqs()
     
     def _initial_profile(self) -> Tuple[float, float]:
         PROFILE_LEN = 1024

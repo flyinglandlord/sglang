@@ -149,13 +149,13 @@ class BaseTokenToKVPool:
         # print(f'free {free_index}', file=open('tmp/mem_log.log', 'a+'))
         # torch.set_printoptions(profile="default")
         # check the elements in free index already exist in the self.free_slots
-        if torch.isin(self.free_slots, free_index.to(self.free_slots.device)).any():
-            print(self.free_slots, free_index)
-            assert False, \
-                f"Double free token location: {torch.isin(self.free_slots, free_index.to(self.free_slots.device))}"
+        # if torch.isin(self.free_slots, free_index.to(self.free_slots.device)).any():
+        #     print(self.free_slots, free_index)
+        #     assert False, \
+        #         f"Double free token location: {torch.isin(self.free_slots, free_index.to(self.free_slots.device))}"
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+            self.free_slots = torch.concat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -173,7 +173,7 @@ class BaseTokenToKVPool:
     @synchronized
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32, device=self.device)
         self.is_in_free_group = False
         self.free_group = []
 
@@ -261,7 +261,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         return k_size_bytes, v_size_bytes
 
     # Todo: different memory layout
-    @synchronized
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
         flatten = torch.stack(

@@ -285,9 +285,10 @@ class HiCacheController:
         """
 
         def _to_op(op_):
+            time.sleep(2e-3) # wait for model runner to launch kernels
             assert op_.device_indices.is_cuda, "Device indices should be on GPU"
             op_.data = self.mem_pool_device.get_flat_data(op_.device_indices).to(
-                self.mem_pool_host.device
+                self.mem_pool_host.device, non_blocking=True
             )
             self.write_buffer.put(op_)
             return op_
@@ -321,6 +322,7 @@ class HiCacheController:
                             split_ops = operation.split(factor)
                             for op_ in split_ops:
                                 _to_op(op_)
+                        torch.cuda.current_stream().synchronize()
                         continue
 
                     if buffer is None:
@@ -334,6 +336,7 @@ class HiCacheController:
                         or self.write_buffer.empty()
                     ):
                         _to_op(buffer)
+                        torch.cuda.current_stream().synchronize()
                         buffer = None
                 except Empty:
                     continue
