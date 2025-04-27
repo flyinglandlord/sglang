@@ -285,7 +285,6 @@ class HiCacheController:
         """
 
         def _to_op(op_):
-            time.sleep(2e-3) # wait for model runner to launch kernels
             assert op_.device_indices.is_cuda, "Device indices should be on GPU"
             op_.data = self.mem_pool_device.get_flat_data(op_.device_indices).to(
                 self.mem_pool_host.device, non_blocking=True

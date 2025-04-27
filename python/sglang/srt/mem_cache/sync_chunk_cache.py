@@ -74,7 +74,6 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector = KVSelector(
                 self.token_to_kv_pool.head_num,
                 self.token_to_kv_pool.head_dim,
-                self.token_to_kv_pool.layer_num,
             )
         return self.kv_selector
 
@@ -319,20 +318,17 @@ class SyncChunkCache(ChunkCache):
         is_prefill = entry.host_value is None
         if is_prefill:
             device_indices = entry.value
-            sync_len = int(device_indices.shape[0])
+            sync_len = len(device_indices)
             if not force_write and sync_len > self.write_buffer_size:
                 sync_len = self.write_buffer_size
                 device_indices = device_indices[:sync_len]
         else:
-            host_len = entry.host_value.shape[0]
-            sync_len = entry.value.shape[0] - host_len
+            host_len = len(entry.host_value)
+            sync_len = len(entry.value) - host_len
             if sync_len == 0:
                 return # no need to write
-            if not force_write:
-                if sync_len < self.sync_chunk_size:
-                    return # wait for more tokens
-                if sync_len > self.write_buffer_size:
-                    sync_len = self.write_buffer_size
+            if not force_write and sync_len > self.write_buffer_size:
+                sync_len = self.write_buffer_size
             device_indices = entry.value[host_len: host_len + sync_len]
         host_indices = self.cache_controller.write(device_indices, node_id=entry)
         if host_indices is None:
@@ -355,10 +351,10 @@ class SyncChunkCache(ChunkCache):
 
     def _sync_decode(self, req: Req, seq_len: int, is_recompute: bool = False):
         # add a write operation for this one token generated in this step
-        if req.rid not in self.entries:
+        entry: SyncCacheEntry = self.entries.get(req.rid)
+        if entry is None:
             # print(f"WARNING: Request {req.rid} not in cache")
             return # scheduler will remove request before the my_scheduler call this
-        entry: SyncCacheEntry = self.entries[req.rid]
         if is_recompute and not entry.evicted:
             raise RuntimeError(f"Request {req.rid} not evicted, recompute is not allowed")
         device_indices = self.req_to_token_pool.req_to_token[
@@ -370,7 +366,7 @@ class SyncChunkCache(ChunkCache):
             entry.evicted_len = 0
             if entry.host_value is not None:
                 self.token_to_kv_pool_host.update_synced(entry.host_value)
-        if entry.is_synced:
+        if entry.is_synced and len(entry.value) - len(entry.host_value) >= self.sync_chunk_size:
             self._write_host(entry, req)
     
     def _sync_prefill(self, req: Req, seq_len: int):
@@ -423,8 +419,7 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector.update_with_batch(batch, self.req_to_remove)
         with self.entries_lock:
             is_extend = batch.forward_mode.is_extend()
-            seq_lens = batch.seq_lens_cpu
-            for i, req in enumerate(batch.reqs):
+            for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu):
                 if req.rid in self.req_to_remove:
                     record = self.writing_records.get(req.rid)
                     if record is None or self.writing_records[req.rid].empty():
@@ -433,9 +428,9 @@ class SyncChunkCache(ChunkCache):
                             del self.writing_records[req.rid]
                     continue
                 if is_extend:
-                    self._sync_prefill(req, seq_lens[i])
+                    self._sync_prefill(req, int(seq_len))
                 else:
-                    self._sync_decode(req, seq_lens[i])
+                    self._sync_decode(req, int(seq_len))
         if not self._is_writing_overloaded():
             self.sync_unsynced_reqs()
     

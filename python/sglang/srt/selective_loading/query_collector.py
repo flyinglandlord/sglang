@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 
 ENABLE_QUERY_COLLECTOR = False # or ENABLE_KV_SELECTOR
@@ -15,28 +15,29 @@ class SingletonMeta(type):
 
 
 class QueryCollector(metaclass=SingletonMeta):
-    def __init__(self):
-        self.queries: List[torch.Tensor] = []
-        self.counter = 0
+    def __init__(self) -> None:
+        self.queries: torch.Tensor = None
+        self.cur_layer: int = 0
+        self.added_layer_num: int = 0
         self.sampled_layers = set(SAMPLED_LAYERS)
+    
+    def init_query_collector(self, max_token_num: int, hidden_dim: int, dtype: torch.dtype):
+        print(f"QueryCollector: max_token_num {max_token_num}, hidden_dim {hidden_dim}, dtype {dtype}")
+        self.queries = torch.zeros((max_token_num, len(self.sampled_layers), hidden_dim), dtype=dtype)
     
     def add_query(self, query: torch.Tensor) -> None:
         # NOTE: (1) This operation is not permitted when using CUDA graph
         # (2) The performance of this operation is not guaranteed to be good
         # (3) Under tensor parallelism or data parallelism, the query tensor
         #     may be split into multiple tensors
-        if self.counter in self.sampled_layers:
-            self.queries.append(query.detach().cpu())
-        self.counter += 1
+        if self.cur_layer in self.sampled_layers:
+            self.queries[:query.shape[0], self.added_layer_num].copy_(query, non_blocking=True)
+            self.added_layer_num += 1
+        self.cur_layer += 1
 
     def reset(self) -> None:
-        self.queries.clear()
-        self.counter = 0
+        self.cur_layer = 0
+        self.added_layer_num = 0
     
-    def fetch_all(self) -> torch.Tensor:
-        assert len(self.queries) > 0, "No queries to fetch"
-        queries = torch.stack(self.queries, dim=1)
-        self.queries.clear()
-        self.counter = 0
-        # print(f"query shape {queries.shape}")
-        return queries # (batch_size, layer_num, head_size * hidden_size)
+    def fetch_all(self, token_num: int) -> torch.Tensor:
+        return self.queries[:token_num].clone() # (token_num, layer_num, head_size * hidden_size)

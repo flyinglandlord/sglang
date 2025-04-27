@@ -74,6 +74,9 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+from sglang.srt.selective_loading.query_collector import (
+    ENABLE_QUERY_COLLECTOR, QueryCollector
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,12 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+        if ENABLE_QUERY_COLLECTOR:
+            QueryCollector().init_query_collector(
+                server_args.max_prefill_tokens,
+                model_config.hidden_size,
+                self.token_to_kv_pool.dtype,
+            )
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
