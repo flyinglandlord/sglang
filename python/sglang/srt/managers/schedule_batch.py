@@ -566,6 +566,7 @@ class ScheduleBatch:
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     req_pool_indices: torch.Tensor = None  # shape: [b], int32
     seq_lens: torch.Tensor = None  # shape: [b], int64
+    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
 
     # for selective loading, indicate the length of the input_ids 
     seq_full_lens: torch.Tensor = None  # shape: [b], int64
@@ -734,7 +735,8 @@ class ScheduleBatch:
         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens = self.seq_lens_cpu.to(
             self.device, non_blocking=True
         )
 
@@ -789,7 +791,8 @@ class ScheduleBatch:
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens = self.seq_lens_cpu.to(
             self.device
         )
         self.input_embeds = (
@@ -800,7 +803,7 @@ class ScheduleBatch:
 
         for i in range(bs):
             assert len(self.tree_cache.entries[self.reqs[i].rid].value) == self.seq_lens[i], \
-                f"something wrong with the tree cache: token slots number not equal {self.tree_cache.entries[self.req[i].rid].values} and {self.seq_lens[i]}"
+                f"something wrong with the tree cache: token slots number not equal {self.tree_cache.entries[self.reqs[i].rid].values} and {self.seq_lens[i]}"
             self.req_to_token_pool.write(
                 (self.req_pool_indices[i], slice(0, self.seq_lens[i])),
                 self.tree_cache.entries[self.reqs[i].rid].value,
@@ -881,7 +884,8 @@ class ScheduleBatch:
         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens = self.seq_lens_cpu.to(
             self.device, non_blocking=True
         )
         self.input_embeds = (
@@ -993,7 +997,7 @@ class ScheduleBatch:
         )
 
         retracted_reqs = []
-        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        seq_lens_cpu = self.seq_lens_cpu
         first_iter = True
         while (
             self.token_to_kv_pool.available_size()
@@ -1114,6 +1118,7 @@ class ScheduleBatch:
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64, device="cpu")
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1150,12 +1155,14 @@ class ScheduleBatch:
                 (self.req_pool_indices, locs), self.out_cache_loc
             )
             self.seq_lens = self.seq_lens + 1
+            self.seq_lens_cpu = self.seq_lens_cpu + 1
         else:
             # A faster in-place version
             self.req_to_token_pool.write(
                 (self.req_pool_indices, locs), self.out_cache_loc
             )
             self.seq_lens.add_(1)
+            self.seq_lens_cpu.add_(1)
         self.seq_lens_sum += bs
 
     def filter_batch(
@@ -1189,6 +1196,7 @@ class ScheduleBatch:
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
+        self.seq_lens_cpu = self.seq_lens.to("cpu", non_blocking=True)
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[new_indices]
@@ -1220,6 +1228,7 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens_cpu = torch.concat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:

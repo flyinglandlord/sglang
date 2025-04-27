@@ -50,7 +50,7 @@ class KVSelectEntry:
 
 
 class KVSelector:
-    def __init__(self, head_num: int, head_dim: int, layer_num: int):
+    def __init__(self, head_num: int, head_dim: int):
         self.entries: Dict[str, KVSelectEntry] = {}
         self.compute_op_count: Dict[str, int] = {}
         self.finished_reqs: Set[str] = set()
@@ -63,7 +63,6 @@ class KVSelector:
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = len(SAMPLED_LAYERS)
-        print(f"KVSelector: head_num {head_num}, head_dim {head_dim}, layer_num {layer_num}")
     
     def reset(self):
         self.stop_event.set()
@@ -81,10 +80,10 @@ class KVSelector:
         """NOTE: The query tensors captured by QueryCollector are not associated
         with any request ID. This function matches the query tensors with the
         last batch of requests in order."""
-        queries = self.query_collector.fetch_all()
+        queries = self.query_collector.fetch_all(
+            batch.extend_num_tokens if batch.forward_mode.is_extend() else len(batch.reqs)
+        )
         if batch.forward_mode.is_extend():
-            assert queries.shape[0] == batch.extend_num_tokens, \
-                f"Query shape {queries.shape[0]} does not match extend_num_tokens {batch.extend_num_tokens}"
             cunum_tokens = 0
             for req in batch.reqs:
                 if req.rid not in req_to_remove:
@@ -100,8 +99,6 @@ class KVSelector:
                         self.cached_queries[req.rid].put(query.transpose(0, 1))
                 cunum_tokens += req.extend_input_len
         else:
-            assert queries.shape[0] == len(batch.reqs), \
-                f"Query shape {queries.shape[0]} does not match num_tokens {batch.num_tokens}"
             for i, req in enumerate(batch.reqs):
                 if req.rid not in self.entries or req.rid in req_to_remove:
                     continue # this request have already finished
