@@ -230,6 +230,7 @@ class ModelRunner:
             QueryCollector().init_query_collector(
                 server_args.max_prefill_tokens,
                 model_config.hidden_size,
+                model_config.num_hidden_layers,
                 self.token_to_kv_pool.dtype,
             )
         if self.device == "cuda":

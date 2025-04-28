@@ -357,8 +357,9 @@ class MyScheduler(Scheduler):
                     #         self.avg_prefill_time = (ed - st)
                     #     else:
                     #         self.avg_prefill_time = (self.avg_prefill_time + (ed - st)) / 2
-
+                self.tree_cache.cache_controller.enable_write.set()
                 self.process_batch_result(batch, result)
+                self.tree_cache.cache_controller.enable_write.clear()
             else:
                 # Self-check and re-init some states when the server is idle
                 self.check_memory()
@@ -703,7 +704,7 @@ class MyScheduler(Scheduler):
             
             self.last_schedule = time.time()
             if self.running_batch is not None:
-                seq_lens_cpu = self.running_batch.seq_lens.cpu().numpy()
+                seq_lens_cpu = self.running_batch.seq_lens_cpu.numpy()
                 before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
             else:
                 before_req_nums = len(self.waiting_queue) + self.offload_manager.get_total_reqs()

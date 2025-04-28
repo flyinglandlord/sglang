@@ -37,7 +37,7 @@ class SyncChunkCache(ChunkCache):
         self, 
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: MHATokenToKVPool,
-        sync_chunk_size: int = 64,
+        sync_chunk_size: int = 32,
     ):
         assert isinstance(token_to_kv_pool, MHATokenToKVPool), \
             f"token_to_kv_pool must be MHATokenToKVPool, but got {type(req_to_token_pool)}"
@@ -49,7 +49,6 @@ class SyncChunkCache(ChunkCache):
         # data fields for loading and writing profilers
         initial_load_speed, self.write_speed = self._initial_profile()
         print(f"Initial load speed: {initial_load_speed:.2f} tokens/s, write speed: {self.write_speed:.2f} tokens/s")
-        self.write_buffer_size = 2048
         self.loading_token_num = 0
         self.write_token_num = 0
         self.wrote_token_num = 0
@@ -258,7 +257,7 @@ class SyncChunkCache(ChunkCache):
     def _poll_write_ack_queue(self):
         while not self.stop_event.is_set():
             try:
-                ack = self.cache_controller.ack_write_queue.get(timeout=0.1)
+                ack = self.cache_controller.ack_write_queue.get(timeout=1)
                 with self.entries_lock:
                     entry: SyncCacheEntry = self.entries.get(ack.rid)
                     assert ack.rid in self.writing_records, \
@@ -319,16 +318,11 @@ class SyncChunkCache(ChunkCache):
         if is_prefill:
             device_indices = entry.value
             sync_len = len(device_indices)
-            if not force_write and sync_len > self.write_buffer_size:
-                sync_len = self.write_buffer_size
-                device_indices = device_indices[:sync_len]
         else:
             host_len = len(entry.host_value)
             sync_len = len(entry.value) - host_len
             if sync_len == 0:
                 return # no need to write
-            if not force_write and sync_len > self.write_buffer_size:
-                sync_len = self.write_buffer_size
             device_indices = entry.value[host_len: host_len + sync_len]
         host_indices = self.cache_controller.write(device_indices, node_id=entry)
         if host_indices is None:
@@ -383,7 +377,7 @@ class SyncChunkCache(ChunkCache):
         self.entries[req.rid] = entry
         entry.req = req
         req.last_node = entry
-        if self._is_writing_overloaded():
+        if self._is_writing_overloaded(5):
             # print(f"WARNING: delay writing {req.rid}")
             entry.is_synced = False
             self.writing_records[req.rid] = Queue()
@@ -419,7 +413,7 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector.update_with_batch(batch, self.req_to_remove)
         with self.entries_lock:
             is_extend = batch.forward_mode.is_extend()
-            for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu):
+            for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
                 if req.rid in self.req_to_remove:
                     record = self.writing_records.get(req.rid)
                     if record is None or self.writing_records[req.rid].empty():
@@ -428,9 +422,9 @@ class SyncChunkCache(ChunkCache):
                             del self.writing_records[req.rid]
                     continue
                 if is_extend:
-                    self._sync_prefill(req, int(seq_len))
+                    self._sync_prefill(req, seq_len)
                 else:
-                    self._sync_decode(req, int(seq_len))
+                    self._sync_decode(req, seq_len)
         if not self._is_writing_overloaded():
             self.sync_unsynced_reqs()
     

@@ -2,10 +2,10 @@ import time
 import torch
 import logging
 import threading
+from multiprocessing import Pool
 from dataclasses import dataclass
 from typing import Dict, Set, List, Tuple, Optional
 from queue import Empty, Full, Queue
-from einops import rearrange, einsum
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.selective_loading.query_collector import QueryCollector, SAMPLED_LAYERS
@@ -54,7 +54,7 @@ class KVSelector:
         self.entries: Dict[str, KVSelectEntry] = {}
         self.compute_op_count: Dict[str, int] = {}
         self.finished_reqs: Set[str] = set()
-        self.cached_queries: Dict[str, Queue] = {}
+        self.cached_queries: Dict[str, List[torch.Tensor]] = {}
         self.query_collector = QueryCollector()
         self.op_queue = Queue()
         self.stop_event = threading.Event()
@@ -90,34 +90,31 @@ class KVSelector:
                     if req.rid in self.entries:
                         self.entries[req.rid].update_output_ids(req)
                         seq_end_pos = cunum_tokens + req.extend_input_len
-                        query = queries[seq_end_pos - 1:seq_end_pos]
-                        self.cached_queries[req.rid].put(query.transpose(0, 1))
+                        query = queries[:, seq_end_pos - 1:seq_end_pos]
+                        self.cached_queries[req.rid].append(query)
                     else:
                         self.entries[req.rid] = KVSelectEntry(req.rid, req.origin_input_ids, req.output_ids)
-                        self.cached_queries[req.rid] = Queue()
-                        query = queries[cunum_tokens:cunum_tokens + req.extend_input_len]
-                        self.cached_queries[req.rid].put(query.transpose(0, 1))
+                        query = queries[:, cunum_tokens:cunum_tokens + req.extend_input_len]
+                        self.cached_queries[req.rid] = [query]
                 cunum_tokens += req.extend_input_len
         else:
             for i, req in enumerate(batch.reqs):
                 if req.rid not in self.entries or req.rid in req_to_remove:
                     continue # this request have already finished
-                assert req.rid in self.cached_queries, \
-                    f"Request {req.rid} not found in cached queries"
                 self.entries[req.rid].update_output_ids(req)
-                query = queries[i:i + 1]
-                self.cached_queries[req.rid].put(query.transpose(0, 1))
+                query = queries[:, i:i + 1]
+                self.cached_queries[req.rid].append(query)
 
     def post_key_cache(self, rid: str, key: torch.Tensor) -> None:
-        if rid not in self.cached_queries or rid not in self.entries:
+        entry: KVSelectEntry = self.entries.get(rid)
+        cached_query = self.cached_queries.get(rid)
+        if cached_query is None or entry is None:
             logger.warning(f"Request {rid} not found in kv selector, ignoring posted key cache")
             return
-        try:
-            query = self.cached_queries[rid].get_nowait()
-        except Empty:
+        if len(cached_query) == 0:
             logger.warning(f"Request {rid} has no cached query, ignoring posted key cache")
             return
-        entry: KVSelectEntry = self.entries[rid]
+        query = cached_query.pop(0)
         entry.accumu_length += query.shape[1]
         assert key.shape[1] >= entry.accumu_length, \
             f"Key shape {key.shape[1]} is less than accumulated length {entry.accumu_length}"
@@ -189,7 +186,8 @@ class KVSelector:
                 continue
             if op.rid not in self.finished_reqs and op.rid in self.entries:
                 try:
-                    self._compute_op(op)
+                    pass
+                    # self._compute_op(op)
                 except Exception as e:
                     print(f"KVSelector: compute op {op.rid} failed: {e}")
                     print(f"KVSelector: op {op.rid} query shape {op.query.shape}, key shape {op.key.shape}")
@@ -200,32 +198,32 @@ class KVSelector:
                     if op.rid in self.finished_reqs:
                         del self.compute_op_count[op.rid]
                         self.finished_reqs.remove(op.rid)
-    
+
     @torch.inference_mode()
     def _compute_op(self, op: KVSelectOperation) -> None:
+        entry: KVSelectEntry = self.entries.get(op.rid)
+        if entry is None:
+            return
         # do self-attention computation on CPU
         query = op.query.view(self.layer_num, op.query.shape[1], -1, self.head_dim)
         query = query.transpose(1, 2) # (layer_num, head_num, seq_length, head_dim)
         key = op.key.transpose(1, 2) # (layer_num, head_num, seq_length, head_dim)
         # print(f"KVSelector: compute op {op.rid} query shape {query.shape}, key shape {key.shape}")
+        layer_num = query.shape[0]
+        head_num = query.shape[1]
+        key_len = key.shape[2]
+        query_len = query.shape[2]
         time_start = time.time()
         group_query_num = query.shape[1] // key.shape[1]
-        query = rearrange(query, "b (h g) l d -> b g h l d", g=group_query_num)
-        scores = einsum(query, key, "b g h l d, b h s d -> b h l s")
-        if query.shape[3] == key.shape[3]: # prefill stage, apply casual mask
-            mask = torch.tril(torch.ones((query.shape[3], query.shape[3])), device=query.device).unsqueeze(0)
-            scores = scores.masked_fill(mask == 0, float("-inf"))
-        scores = scores.softmax(dim=-1)
-        # average over layers, heads and query length
-        scores = scores.mean(dim=(0, 1, 2))
-        entry: KVSelectEntry = self.entries.get(op.rid)
-        if entry is None:
-            return
+        # repeat key
+        key = key.repeat_interleave(group_query_num, dim=1)
+        # compute attention scores
+        scores = torch.einsum("lhqd,lhkd->lhqk", query, key) / (self.head_dim ** 0.5)
+        scores = scores.softmax(dim=3) # do softmax on the key length dimension
+        scores = scores.sum(dim=(0, 1, 2)) # (key_len)
         if entry.accumu_attn_scores is None:
-            # print(op.rid, "score shape", scores.shape, "accumulated score shape", None)
-            entry.accumu_attn_scores = scores
+            entry.accumu_attn_scores = scores # (key_len)
         else:
-            # print(op.rid, "score shape", scores.shape, "accumulated score shape", entry.accumu_attn_scores.shape)
             scores[:-1] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
         elapsed_time = time.time() - time_start
