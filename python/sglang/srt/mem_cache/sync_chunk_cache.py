@@ -73,6 +73,7 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector = KVSelector(
                 self.token_to_kv_pool.head_num,
                 self.token_to_kv_pool.head_dim,
+                self.token_to_kv_pool_host.kv_buffer[0],
             )
         return self.kv_selector
 
@@ -275,16 +276,13 @@ class SyncChunkCache(ChunkCache):
                                 self._evict_device(ack.req, entry.written_len - entry.evicted_len)
                                 entry.evicted_len = entry.written_len
                             if self.kv_selector is not None:
-                                k_cache = self.token_to_kv_pool_host.get_flat_data(
-                                    entry.host_value
-                                )[0]
-                                self.kv_selector.post_key_cache(ack.rid, k_cache)
-                    if record.empty():
-                        if ack.rid in self.req_to_evict:
-                            del self.req_to_evict[ack.rid]
-                        elif ack.rid in self.req_to_remove:
-                            self.req_to_remove.remove(ack.rid)
-                            del self.writing_records[ack.rid]
+                                self.kv_selector.post_key_cache(ack.rid, entry.host_value)
+                if record.empty():
+                    if ack.rid in self.req_to_evict:
+                        del self.req_to_evict[ack.rid]
+                    elif ack.rid in self.req_to_remove:
+                        self.req_to_remove.remove(ack.rid)
+                        del self.writing_records[ack.rid]
             except Empty:
                 self.sync_unsynced_reqs()
             except Exception as e:

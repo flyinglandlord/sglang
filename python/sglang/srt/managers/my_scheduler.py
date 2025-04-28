@@ -357,9 +357,9 @@ class MyScheduler(Scheduler):
                     #         self.avg_prefill_time = (ed - st)
                     #     else:
                     #         self.avg_prefill_time = (self.avg_prefill_time + (ed - st)) / 2
-                self.tree_cache.cache_controller.enable_write.set()
+                self.tree_cache.cache_controller.can_write()
                 self.process_batch_result(batch, result)
-                self.tree_cache.cache_controller.enable_write.clear()
+                self.tree_cache.cache_controller.dont_write()
             else:
                 # Self-check and re-init some states when the server is idle
                 self.check_memory()
