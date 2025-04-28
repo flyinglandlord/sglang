@@ -116,8 +116,8 @@ class KVSelector:
             return
         query = entry.cached_queries.pop(0)
         entry.accumu_length += query.shape[1]
-        assert key_indices.shape[1] >= entry.accumu_length, \
-            f"Key shape {key_indices.shape[1]} is less than accumulated length {entry.accumu_length}"
+        assert key_indices.shape[0] >= entry.accumu_length, \
+            f"Key shape {key_indices.shape[0]} is less than accumulated length {entry.accumu_length}"
         self.op_queue.put(KVSelectOperation(rid, query, key_indices[: entry.accumu_length]))
         self.compute_op_count[rid] = self.compute_op_count.get(rid, 0) + 1
 
