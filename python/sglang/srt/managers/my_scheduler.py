@@ -567,6 +567,7 @@ class MyScheduler(Scheduler):
                 schedule_decision.remove_request(req)
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
+            # self.local_search(schedule_decision, v_token)
 
         print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
         for req in valid_thr.keys():
@@ -580,6 +581,9 @@ class MyScheduler(Scheduler):
         print(len(schedule_decision.new_load_list), file=open('tmp/schedule_output.txt', "a"))
         print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
         print(len(schedule_decision.new_prefill_list), file=open('tmp/schedule_output.txt', "a"))
+        print('waiting queue', self.waiting_queue, file=open('tmp/schedule_output.txt', "a"))
+        print(len(self.waiting_queue), file=open('tmp/schedule_output.txt', "a"))
+        print(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size(), file=open('tmp/schedule_output.txt', "a"))
         print('--------------------------------', file=open('tmp/schedule_output.txt', "a"))
 
         return schedule_decision
