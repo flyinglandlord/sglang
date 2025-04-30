@@ -803,7 +803,7 @@ class ScheduleBatch:
 
         for i in range(bs):
             assert len(self.tree_cache.entries[self.reqs[i].rid].value) == self.seq_lens[i], \
-                f"something wrong with the tree cache: token slots number not equal {self.tree_cache.entries[self.reqs[i].rid].values} and {self.seq_lens[i]}"
+                f"something wrong with the tree cache: token slots number not equal {self.tree_cache.entries[self.reqs[i].rid].value.shape} and {self.seq_lens[i]}"
             self.req_to_token_pool.write(
                 (self.req_pool_indices[i], slice(0, self.seq_lens[i])),
                 self.tree_cache.entries[self.reqs[i].rid].value,

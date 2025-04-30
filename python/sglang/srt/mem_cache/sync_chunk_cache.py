@@ -31,6 +31,7 @@ class SyncCacheEntry(ChunkCacheEntry):
         self.written_len: int = 0
         self.seq_len: int = 0
         self.is_synced: bool = True
+        self.full_host_value: Optional[torch.Tensor] = None
 
 class SyncChunkCache(ChunkCache):
     def __init__(
@@ -100,9 +101,9 @@ class SyncChunkCache(ChunkCache):
         # free host memory
         if req.rid in self.entries:
             entry: SyncCacheEntry = self.entries[req.rid]
-            if entry.host_value is not None:
-                self.token_to_kv_pool_host.free(entry.host_value)
-                entry.host_value = None
+            if entry.full_host_value is not None:
+                self.token_to_kv_pool_host.free(entry.full_host_value)
+                entry.full_host_value = None
                 entry.host_req_pool_idx = None
             del self.entries[req.rid]
         else: 
@@ -176,40 +177,40 @@ class SyncChunkCache(ChunkCache):
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
+        entry.host_value = None
         entry.evicted = True
         req.last_node = entry
         req.req_pool_idx = None
 
-    def load_back(self, req: Req, load_indices: Optional[torch.Tensor] = None):
+    def load_back(self, req: Req, load_indices: Optional[List[int]] = None):
         rid = req.rid
         with self.entries_lock:
-            if rid not in self.entries:
-                raise RuntimeError(f"Request {rid} not in cache")
-            entry: SyncCacheEntry = self.entries[rid]
-            if not entry.backuped:
-                raise RuntimeError(f"Request {rid} not backuped")
-            if entry.host_value is None:
-                raise RuntimeError(f"Host value is None for rid {rid}")
-            if entry.loading:
-                raise RuntimeError(f"Request {rid} is loading")
+            entry: SyncCacheEntry = self.entries.get(rid)
+            assert entry is not None, f"Request {rid} not in cache"
+            assert entry.backuped, f"Request {rid} not backuped"
+            assert entry.full_host_value is not None, f"Request {rid} host value is None"
+            assert not entry.loading, f"Request {rid} is loading"
             if not self.writing_records[req.rid].empty():
                 raise RuntimeError(f"Request {rid} is writing")
-        # allocate device memory
-        host_value = entry.host_value
-        if load_indices is not None:
-            host_value = host_value[load_indices]
-            assert host_value.shape[0] == load_indices.shape[0], \
-                f"host_value {host_value.shape[0]} != load_indices {load_indices.shape[0]}"
-        device_indices = self.cache_controller.load(host_value, node_id=entry)
-        if device_indices is None:
-            raise RuntimeError(f'Failed to allocate device memory for request {rid}')
-        # update the entry
-        req.req_pool_idx = self.req_to_token_pool.alloc(1)[0]
-        entry.loading = True
-        entry.value = device_indices
-        entry.evicted = False
-        entry.evicted_len = 0
-        self.loading_token_num += device_indices.shape[0]
+            # load the device memory
+            host_value = entry.full_host_value
+            if load_indices is not None:
+                host_value = host_value[load_indices]
+                assert host_value.shape[0] == len(load_indices), \
+                    f"host_value {host_value.shape[0]} != load_indices {len(load_indices)}"
+            entry.host_value = host_value
+            device_indices = self.cache_controller.load(host_value, node_id=entry)
+            if device_indices is None:
+                raise RuntimeError(f'Failed to allocate device memory for request {rid}')
+            # update the entry
+            req.req_pool_idx = self.req_to_token_pool.alloc(1)[0]
+            entry.loading = True
+            entry.value = device_indices
+            entry.evicted = False
+            entry.evicted_len = 0
+            entry.seq_len = int(device_indices.shape[0])
+            entry.written_len = entry.seq_len
+            self.loading_token_num += device_indices.shape[0]
 
     def get_loading_workload(self) -> Tuple[int, float]:
         self.load_check()
@@ -226,16 +227,18 @@ class SyncChunkCache(ChunkCache):
     def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
         if self.kv_selector is None:
             return self.load_back(req)
-        assert req.rid in self.entries, f"Request {req.rid} not in cache"
-        if target_length > self.entries[req.rid].host_value.shape[0]:
-            print(f"target_length {target_length} less than host_vlaue length {self.entries[req.rid].host_value.shape[0]} rid: {req.rid}")
+        entry: SyncCacheEntry = self.entries.get(req.rid)
+        assert entry is not None, f"Request {req.rid} not in cache"
+        if target_length > entry.full_host_value.shape[0]:
             return self.load_back(req)
         if wait:
-            self.kv_selector.wait_for_ready(req)
+            self.kv_selector.wait_for_ready(req, target_length)
         indices = self.kv_selector.select_kv(req, target_length)
-        print(f"Request {req.rid} selected kv {indices.shape[0]} for loading")
         if indices is None:
-            raise RuntimeError(f"Failed to select kv for request {req.rid}")
+            print(f"WARNING: No kv selected for request {req.rid}, loading all")
+            self.kv_selector.restore_req(req)
+            return self.load_back(req)
+        print(f"Request {req.rid} selected kv {len(indices)} for loading")
         self.load_back(req, indices)
 
     def load_check(self, req: Optional[Req] = None) -> Optional[bool]:
@@ -276,7 +279,9 @@ class SyncChunkCache(ChunkCache):
                                 self._evict_device(ack.req, entry.written_len - entry.evicted_len)
                                 entry.evicted_len = entry.written_len
                             if self.kv_selector is not None:
-                                self.kv_selector.post_key_cache(ack.rid, entry.host_value)
+                                self.kv_selector.post_key_cache(
+                                    ack.rid, entry.full_host_value, write_num
+                                )
                 if record.empty():
                     if ack.rid in self.req_to_evict:
                         del self.req_to_evict[ack.rid]
@@ -295,7 +300,7 @@ class SyncChunkCache(ChunkCache):
         entry: SyncCacheEntry = self.entries[req.rid]
         if entry.loading:
             raise RuntimeError(f"Request {req.rid} is loading")
-        return entry.host_value is not None and entry.is_synced
+        return entry.full_host_value is not None and entry.is_synced
 
     def wait_write(self, req: Req):
         # [deprecated] wait for a certain request to finish writing
@@ -312,7 +317,7 @@ class SyncChunkCache(ChunkCache):
                 raise RuntimeError(f"Request {req.rid} write op timeout")
     
     def _write_host(self, entry: SyncCacheEntry, req: Req, force_write: bool = False):
-        is_prefill = entry.host_value is None
+        is_prefill = entry.full_host_value is None
         if is_prefill:
             device_indices = entry.value
             sync_len = len(device_indices)
@@ -326,11 +331,13 @@ class SyncChunkCache(ChunkCache):
         if host_indices is None:
             raise RuntimeError("Failed to allocate host memory for backup")
         if is_prefill:
-            assert entry.host_value is None, \
+            assert entry.host_value is None and entry.full_host_value is None, \
                 f"Request {req.rid} host value is not None, {entry.host_value.shape}"
+            entry.host_value = host_indices
+            entry.full_host_value = host_indices
         else:
-            host_indices = torch.cat([entry.host_value, host_indices], dim=0)
-        entry.host_value = host_indices
+            entry.host_value = torch.cat([entry.host_value, host_indices], dim=0)
+            entry.full_host_value = torch.cat([entry.full_host_value, host_indices], dim=0)
         self.write_token_num += sync_len
         entry.backuped = True
         entry.last_writing_pos = self.write_token_num
