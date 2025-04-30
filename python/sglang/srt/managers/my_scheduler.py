@@ -723,7 +723,7 @@ class MyScheduler(Scheduler):
         self.update_buffer_size()
 
         self.waiting_queue.extend(self.offload_manager.step())
-        if self.next_prefill_batch is not None:
+        if self.next_prefill_batch is not None and len(self.next_prefill_batch) > 0:
             bs = len(self.next_prefill_batch)
             reqs = self.next_prefill_batch
             input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
