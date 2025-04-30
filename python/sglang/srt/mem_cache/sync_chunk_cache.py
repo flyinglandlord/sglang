@@ -289,6 +289,9 @@ class SyncChunkCache(ChunkCache):
                 raise e
 
     def can_load_back(self, req: Req) -> bool:
+        # for ablation study
+        # return False
+        
         # check if the request can be loaded back
         if req.rid not in self.entries:
             return False

@@ -133,6 +133,8 @@ class Scheduler:
         dp_rank: Optional[int],
     ):
         self.decode_time_stamp = None
+        self.cum_buffer_size = None
+        self.rebuffer_time = None
         
         # Parse args
         self.server_args = server_args
@@ -1360,6 +1362,8 @@ class Scheduler:
                 self.tree_cache.cache_finished_req(req)
                 if self.cum_buffer_size is not None:
                     del self.cum_buffer_size[req.rid]
+                if self.rebuffer_time is not None:
+                    del self.rebuffer_time[req.rid]
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
