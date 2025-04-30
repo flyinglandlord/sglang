@@ -363,8 +363,10 @@ class SyncChunkCache(ChunkCache):
         if is_recompute:
             entry.evicted = False
             entry.evicted_len = 0
-            if entry.host_value is not None:
+            if entry.full_host_value is not None:
+                entry.host_value = entry.full_host_value
                 self.token_to_kv_pool_host.update_synced(entry.host_value)
+                entry.written_len = len(entry.host_value)
         if entry.is_synced and len(entry.value) - len(entry.host_value) >= self.sync_chunk_size:
             self._write_host(entry, req)
     
