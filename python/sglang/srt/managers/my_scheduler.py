@@ -85,10 +85,7 @@ class MyScheduleDecision():
         # self.initialize_keep_running_list()
     
     def estimate_req_kv_budget(self, req):
-        min_generated_num = 64
-        return (
-            len(req.origin_input_ids) + len(req.output_ids) + min_generated_num
-        )
+        return len(req.origin_input_ids) + len(req.output_ids) + self.min_generated_num
 
     def initialize_keep_running_list(self, available_tokens, available_requests):
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
