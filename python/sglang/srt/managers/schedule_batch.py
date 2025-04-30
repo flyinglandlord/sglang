@@ -1196,7 +1196,7 @@ class ScheduleBatch:
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
-        self.seq_lens_cpu = self.seq_lens.to("cpu", non_blocking=True)
+        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[new_indices]

@@ -156,6 +156,9 @@ class HiCacheController:
         self.ack_load_queue = Queue()
 
         self.stop_event = threading.Event()
+        self.enable_write = threading.Event()
+        self.writing_event = threading.Event()
+        self.writing_event.set()
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(
             self.stop_event, buffer_count=10, max_buffer_size=100
@@ -195,6 +198,8 @@ class HiCacheController:
             target=self.load_thread_func_buffer, daemon=True
         )
         self.stop_event.clear()
+        self.enable_write.clear()
+        self.writing_event.set()
         self.write_thread.start()
         self.load_thread.start()
 
@@ -278,17 +283,28 @@ class HiCacheController:
                     continue
                 except Exception as e:
                     logger.error(e)
+    
+    def can_write(self):
+        self.enable_write.set()
+        time.sleep(5e-3)
+        self.writing_event.wait()
+    
+    def dont_write(self):
+        self.enable_write.clear()
 
     def write_aux_func(self, no_wait=False):
         """
         Auxiliary function to prepare the buffer for write operations.
         """
 
-        def _to_op(op_):
+        def _to_op(op_: CacheOperation):
             assert op_.device_indices.is_cuda, "Device indices should be on GPU"
-            op_.data = self.mem_pool_device.get_flat_data(op_.device_indices).to(
-                self.mem_pool_host.device, non_blocking=True
-            )
+            data = self.mem_pool_device.get_flat_data(op_.device_indices)
+            self.enable_write.wait()
+            self.writing_event.clear()
+            op_.data = data.to(self.mem_pool_host.device, non_blocking=True)
+            self.writing_event.set()
+            self.write_stream.synchronize()
             self.write_buffer.put(op_)
             return op_
 
@@ -321,7 +337,6 @@ class HiCacheController:
                             split_ops = operation.split(factor)
                             for op_ in split_ops:
                                 _to_op(op_)
-                        torch.cuda.current_stream().synchronize()
                         continue
 
                     if buffer is None:
@@ -335,7 +350,6 @@ class HiCacheController:
                         or self.write_buffer.empty()
                     ):
                         _to_op(buffer)
-                        torch.cuda.current_stream().synchronize()
                         buffer = None
                 except Empty:
                     continue
