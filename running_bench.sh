@@ -10,7 +10,7 @@ rm /mtc/chenjunyi/sglang/tmp/buffer_size.log
 /mtc/yongyang/miniconda/envs/sgl_test/bin/python -m sglang.bench_serving  \
     --port 8000 \
     --backend sglang \
-    --num-prompts 70 \
+    --num-prompts 50 \
     --dataset-name random \
     --dataset-path /home/devsft/ShareGPT_V3_unfiltered_cleaned_split.json \
     --random-input 512 --random-output 2048 \

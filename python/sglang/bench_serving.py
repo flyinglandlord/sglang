@@ -318,7 +318,7 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
-    speed = 40.0
+    speed = random.choice([15.0, 30.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -602,7 +602,7 @@ def sample_sharegpt_requests(
     ]
 
     # Shuffle the dataset.
-    # random.shuffle(dataset)
+    random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[Tuple[str, int, int]] = []
