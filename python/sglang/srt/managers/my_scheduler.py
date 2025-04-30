@@ -669,22 +669,22 @@ class MyScheduler(Scheduler):
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
             # self.local_search(schedule_decision, v_token)
 
-        print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
-        for req in valid_thr.keys():
-            print(f'({req.rid}, {self.estimate_load_cost(req)}, {req in schedule_decision.keep_running_list})', end=' ', file=open('tmp/buffer_size.log', 'a'))
-        print('', file=open('tmp/buffer_size.log', 'a'))
-
         # DEBUG: Print the detail of schedule decision to log
-        print('keep_running_list', schedule_decision.keep_running_list, file=open('tmp/schedule_output.txt', "a"))
-        print(len(schedule_decision.keep_running_list), file=open('tmp/schedule_output.txt', "a"))
-        print('new_load_list', schedule_decision.new_load_list, file=open('tmp/schedule_output.txt', "a"))
-        print(len(schedule_decision.new_load_list), file=open('tmp/schedule_output.txt', "a"))
-        print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
-        print(len(schedule_decision.new_prefill_list), file=open('tmp/schedule_output.txt', "a"))
-        print('waiting queue', self.waiting_queue, file=open('tmp/schedule_output.txt', "a"))
-        print(len(self.waiting_queue), file=open('tmp/schedule_output.txt', "a"))
-        print(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size(), file=open('tmp/schedule_output.txt', "a"))
-        print('--------------------------------', file=open('tmp/schedule_output.txt', "a"))
+        # print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
+        # for req in valid_thr.keys():
+        #     print(f'({req.rid}, {self.estimate_load_cost(req)}, {req in schedule_decision.keep_running_list})', end=' ', file=open('tmp/buffer_size.log', 'a'))
+        # print('', file=open('tmp/buffer_size.log', 'a'))
+
+        # print('keep_running_list', schedule_decision.keep_running_list, file=open('tmp/schedule_output.txt', "a"))
+        # print(len(schedule_decision.keep_running_list), file=open('tmp/schedule_output.txt', "a"))
+        # print('new_load_list', schedule_decision.new_load_list, file=open('tmp/schedule_output.txt', "a"))
+        # print(len(schedule_decision.new_load_list), file=open('tmp/schedule_output.txt', "a"))
+        # print('new_prefill_list', schedule_decision.new_prefill_list, file=open('tmp/schedule_output.txt', "a"))
+        # print(len(schedule_decision.new_prefill_list), file=open('tmp/schedule_output.txt', "a"))
+        # print('waiting queue', self.waiting_queue, file=open('tmp/schedule_output.txt', "a"))
+        # print(len(self.waiting_queue), file=open('tmp/schedule_output.txt', "a"))
+        # print(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size(), file=open('tmp/schedule_output.txt', "a"))
+        # print('--------------------------------', file=open('tmp/schedule_output.txt', "a"))
 
         return schedule_decision
             
