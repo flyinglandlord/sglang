@@ -87,10 +87,12 @@ class MyScheduleDecision():
     def estimate_req_kv_budget(self, req):
         return len(req.origin_input_ids) + len(req.output_ids) + self.min_generated_num
 
-    def initialize_keep_running_list(self, available_tokens, available_requests):
+    def initialize_keep_running_list(self, available_tokens, available_requests, min_generated_num=None):
+        if min_generated_num is None:
+            min_generated_num = self.min_generated_num
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
-        self.avail_tokens -= len(self.running_reqs) * self.min_generated_num
+        self.avail_tokens -= len(self.running_reqs) * min_generated_num
         for req in self.running_reqs:
             if self.can_add_request(req):
                 self.add_request(req)
@@ -969,6 +971,12 @@ class MyScheduler(Scheduler):
             if self.running_batch is None:
                 ret = None
             else:
+                # Check whether the running_batch overflow
+                while not self.running_batch.check_decode_mem():
+                    if len(self.running_batch.reqs) == 1:
+                        assert False, "Memory cannot handle even one request"
+                    keep_indices = [i for i in range(len(self.running_batch.reqs))]
+                    self.running_batch.filter_batch()
                 try:
                     self.running_batch = self.update_running_batch(self.running_batch)
                 except Exception as e:
