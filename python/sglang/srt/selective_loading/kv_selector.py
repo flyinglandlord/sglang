@@ -92,10 +92,10 @@ class KVSelector:
             for req in batch.reqs:
                 if req.rid not in req_to_remove:
                     entry: KVSelectEntry = self.entries.get(req.rid)
-                    if entry is not None:
+                    if entry is not None: # recompute, update the entry the same way as decode
                         entry.update_output_ids(req)
                         seq_end_pos = cunum_tokens + req.extend_input_len
-                        query = queries[:, cunum_tokens:seq_end_pos]
+                        query = queries[:, seq_end_pos - 1:seq_end_pos]
                     else:
                         entry = KVSelectEntry(req.rid, req.origin_input_ids, req.output_ids)
                         query = queries[:, cunum_tokens:cunum_tokens + req.extend_input_len]

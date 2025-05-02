@@ -150,6 +150,32 @@ class SyncChunkCache(ChunkCache):
             else: # evict the request immediately
                 self._evict_device(req, seq_len)
 
+    def evict_nowait(self, reqs: List[Req], num_tokens: int) -> Tuple[List[int], List[int]]:
+        # evict the device memory instantly
+        # this is used when the cache is full and we need to evict some requests
+        with self.entries_lock:
+            keep_indices = []
+            for i, req in enumerate(reqs):
+                if self.token_to_kv_pool.available_size() >= num_tokens:
+                    keep_indices.extend(range(i, len(reqs)))
+                    break
+                entry: SyncCacheEntry = self.entries[req.rid]
+                if (
+                    entry.value is not None and
+                    not entry.is_synced and
+                    req.rid not in self.req_to_remove and
+                    req.rid not in self.req_to_evict
+                ):
+                    print(f"Evicting {entry.value.shape[0]} tokens from request {req.rid}, "
+                          f"value shape: {entry.value.shape}")
+                    self._evict_device(req, entry.value.shape[0])
+                else:
+                    keep_indices.append(i)
+        if self.token_to_kv_pool.available_size() < num_tokens:
+            raise RuntimeError(f"Not enough space to evict {num_tokens} tokens")
+        remove_indices = [i for i in range(len(reqs)) if i not in keep_indices]
+        return keep_indices, remove_indices
+
     def get_evicting_reqs(self) -> List[str]:
         return list(self.req_to_evict.keys())
     
