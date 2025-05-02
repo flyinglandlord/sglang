@@ -172,6 +172,8 @@ class SyncChunkCache(ChunkCache):
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
             return False
+        assert evict_len == entry.value.shape[0], \
+            f"Evicting {evict_len} tokens from request {req.rid}, but value shape: {entry.value.shape}"
         if not self.writing_records[req.rid].empty():
             raise RuntimeError(f"Request {req.rid} is writing")
         # evict the whole device memory, but still keep the host memory
@@ -267,41 +269,39 @@ class SyncChunkCache(ChunkCache):
         while not self.stop_event.is_set():
             try:
                 ack = self.cache_controller.ack_write_queue.get(timeout=1)
-                with self.entries_lock:
-                    entry: SyncCacheEntry = self.entries.get(ack.rid)
-                    assert ack.rid in self.writing_records, \
-                        f"Request {ack.rid} not in writing records"
-                    record = self.writing_records[ack.rid]
-                    write_num = record.get_nowait()
-                    self.wrote_token_num += write_num
-                    if entry is not None:
-                        if ack.rid in self.req_to_remove:
-                            if not self.cache_controller.is_writing(ack.rid):
-                                self._cache_finished_req(ack.req)
-                        else:
-                            entry.written_len += write_num
-                            if entry.rid in self.req_to_evict:
-                                full_evict = self._evict_device(
-                                    ack.req, entry.written_len - entry.evicted_len
-                                )
-                                assert record.empty() == full_evict, \
-                                    f"Request {ack.rid} evicting {entry.written_len - entry.evicted_len} tokens, " \
-                                    f"but record {record.empty()} is not empty"
-                                entry.evicted_len = entry.written_len
-                            if self.kv_selector is not None:
-                                self.kv_selector.post_key_cache(
-                                    ack.rid, entry.full_host_value, write_num
-                                )
-                if record.empty():
-                    if ack.rid in self.req_to_evict:
-                        del self.req_to_evict[ack.rid]
-                    elif ack.rid in self.req_to_remove:
-                        self.req_to_remove.remove(ack.rid)
-                        del self.writing_records[ack.rid]
             except Empty:
                 self.sync_unsynced_reqs()
-            except Exception as e:
-                raise e
+                continue
+            record = self.writing_records.get(ack.rid)
+            assert record is not None, f"Request {ack.rid} not in write op count"
+            write_num = record.get_nowait()
+            self.wrote_token_num += write_num
+            with self.entries_lock:
+                entry: SyncCacheEntry = self.entries.get(ack.rid)
+                if entry is not None:
+                    if ack.rid in self.req_to_remove:
+                        if not self.cache_controller.is_writing(ack.rid):
+                            self._cache_finished_req(ack.req)
+                    else:
+                        entry.written_len += write_num
+                        if entry.rid in self.req_to_evict:
+                            full_evict = self._evict_device(
+                                ack.req, entry.written_len - entry.evicted_len
+                            )
+                            assert record.empty() == full_evict, \
+                                f"Request {ack.rid} evicting {entry.written_len - entry.evicted_len} tokens, " \
+                                f"but record {record.empty()} is not empty"
+                            entry.evicted_len = entry.written_len
+                        if self.kv_selector is not None:
+                            self.kv_selector.post_key_cache(
+                                ack.rid, entry.full_host_value, write_num
+                            )
+            if record.empty():
+                if ack.rid in self.req_to_evict:
+                    del self.req_to_evict[ack.rid]
+                elif ack.rid in self.req_to_remove:
+                    self.req_to_remove.remove(ack.rid)
+                    del self.writing_records[ack.rid]
 
     def can_load_back(self, req: Req) -> bool:
         # check if the request can be loaded back
