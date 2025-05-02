@@ -397,6 +397,7 @@ class MyScheduler(Scheduler):
                 self.tree_cache.cache_controller.dont_write()
             else:
                 # Self-check and re-init some states when the server is idle
+                self.tree_cache.cache_controller.enable_write.set()
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -811,7 +812,7 @@ class MyScheduler(Scheduler):
                         assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
     
         if (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval):
-            print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num)
+            print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
             
             self.last_schedule = time.time()
             if self.running_batch is not None:
