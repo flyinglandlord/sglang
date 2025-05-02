@@ -625,7 +625,7 @@ class MyScheduler(Scheduler):
                                             [] if self.running_batch is None else self.running_batch.reqs, 
                                             self.waiting_queue, self.offload_manager.get_all_load_reqs(), self.offload_manager.get_all_evict_reqs(), 
                                             [] if self.next_prefill_batch is None else self.next_prefill_batch,
-                                            self.max_running_requests, self.max_prefill_tokens, self.max_running_requests, self.new_token_ratio)
+                                            self.max_running_requests, self.max_prefill_tokens, int(self.max_running_requests * 0.4), self.new_token_ratio)
 
         # Initalize the previous batch, and fill in the free slots
         schedule_decision.initialize_keep_running_list(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size())
@@ -638,8 +638,10 @@ class MyScheduler(Scheduler):
         if len(self.waiting_queue) > 0:
             running_queue_evict_candidate = []
             waiting_queue_run_candidate = []
+            load_time = self.tree_cache.get_loading_workload()[0] / self.tree_cache.get_loading_workload()[1]
+            write_time = self.tree_cache.get_writing_workload()[0] / self.tree_cache.get_writing_workload()[1]
             for req in schedule_decision.keep_running_list:
-                if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid]:
+                if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * (load_time + write_time + self.reschedule_interval):
                     running_queue_evict_candidate.append(req)
             for req in self.waiting_queue:
                 # (req, req_len, adjusted_value, 'waiting', True)
@@ -652,20 +654,20 @@ class MyScheduler(Scheduler):
                     waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", True))
             
             running_queue_evict_candidate = sorted(running_queue_evict_candidate, key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
-            evict_num = len(running_queue_evict_candidate)
-            running_queue_evict_candidate = running_queue_evict_candidate[-evict_num:]
+            #evict_num = int(len(running_queue_evict_candidate))
+            #running_queue_evict_candidate = running_queue_evict_candidate[-evict_num:]
 
             for req in running_queue_evict_candidate:
                 schedule_decision.remove_request(req)
-                req_len = len(req.origin_input_ids) + len(req.output_ids) + 1
+                req_len = len(req.origin_input_ids) + len(req.output_ids) + 64
                 waiting_queue_run_candidate.append((req, req_len, valid_thr[req], "running", False))
             
             waiting_queue_run_candidate = [req for idx, req in enumerate(waiting_queue_run_candidate) \
                                            if self.cum_buffer_size[req[0].rid] <= 2.0 * self.output_speed[req[0].rid]]
-            waiting_queue_run_candidate = sorted(waiting_queue_run_candidate, key=lambda x: (-x[2], -self.output_speed[x[0].rid]))
+            waiting_queue_run_candidate = sorted(waiting_queue_run_candidate, key=lambda x: (self.cum_buffer_size[x[0].rid], -self.output_speed[x[0].rid]))
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
-            # self.local_search(schedule_decision, v_token)
+            self.local_search(schedule_decision, v_token)
 
         print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
         for req in valid_thr.keys():
