@@ -666,7 +666,7 @@ class MyScheduler(Scheduler):
             waiting_queue_run_candidate = sorted(waiting_queue_run_candidate, key=lambda x: (self.cum_buffer_size[x[0].rid], -self.output_speed[x[0].rid]))
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
-            self.local_search(schedule_decision, v_token)
+            # self.local_search(schedule_decision, v_token)
 
         print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
         for req in valid_thr.keys():
