@@ -124,6 +124,25 @@ class TransferBuffer:
         self.buffers.queue.clear()
 
 
+class WriteTensorBuffer:
+    def __init__(
+        self, dtype: torch.dtype, max_buffer_size: int, 
+        layer_num: int, head_num: int, head_dim: int,
+    ):
+        self.k_buffer = [
+            torch.empty(
+                (max_buffer_size, head_num, head_dim),
+                device="cpu", pin_memory=True, dtype=dtype,
+            ) for _ in range(layer_num)
+        ]
+        self.v_buffer = [
+            torch.empty(
+                (max_buffer_size, head_num, head_dim),
+                device="cpu", pin_memory=True, dtype=dtype,
+            ) for _ in range(layer_num)
+        ]
+
+
 class HiCacheController:
 
     def __init__(
@@ -159,7 +178,22 @@ class HiCacheController:
         self.enable_write = threading.Event()
         self.writing_event = threading.Event()
         self.writing_event.set()
-        self.write_buffer = TransferBuffer(self.stop_event)
+        self.write_buffer_size = 1024
+        self.write_buffer_count = 3
+        self.write_buffer = TransferBuffer(
+            self.stop_event, 
+            buffer_count=self.write_buffer_count, 
+            max_buffer_size=self.write_buffer_size
+        )
+        self.write_buffer_tensors: List[WriteTensorBuffer] = [
+            WriteTensorBuffer(
+                dtype=mem_pool_device.dtype,
+                max_buffer_size=2 * self.write_buffer_size,
+                layer_num=mem_pool_device.layer_num,
+                head_num=mem_pool_device.head_num,
+                head_dim=mem_pool_device.head_dim,
+            ) for _ in range(self.write_buffer_count + 2)
+        ]
         self.load_buffer = TransferBuffer(
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
@@ -299,10 +333,17 @@ class HiCacheController:
 
         def _to_op(op_: CacheOperation):
             assert op_.device_indices.is_cuda, "Device indices should be on GPU"
-            data = self.mem_pool_device.get_flat_data(op_.device_indices)
+            copy_length = len(op_.host_indices)
+            k_list = [k[op_.device_indices] for k in self.mem_pool_device.k_buffer]
+            v_list = [v[op_.device_indices] for v in self.mem_pool_device.v_buffer]
             self.enable_write.wait()
             self.writing_event.clear()
-            op_.data = data.to(self.mem_pool_host.device, non_blocking=True)
+            buffer = self.write_buffer_tensors.pop()
+            for k_cpu, k_gpu in zip(buffer.k_buffer, k_list):
+                k_cpu[:copy_length].copy_(k_gpu, non_blocking=True)
+            for v_cpu, v_gpu in zip(buffer.v_buffer, v_list):
+                v_cpu[:copy_length].copy_(v_gpu, non_blocking=True)
+            op_.data = buffer
             self.writing_event.set()
             self.write_stream.synchronize()
             self.write_buffer.put(op_)
@@ -423,7 +464,16 @@ class HiCacheController:
             operation = self.write_buffer.get()
             if operation is None:
                 continue
-            self.mem_pool_host.assign_flat_data(operation.host_indices, operation.data)
+            buffer: WriteTensorBuffer = operation.data
+            copy_length = len(operation.host_indices)
+            for i, (k, v) in enumerate(zip(buffer.k_buffer, buffer.v_buffer)):
+                self.mem_pool_host.kv_buffer[0, i, operation.host_indices].copy_(
+                    k[: copy_length],
+                )
+                self.mem_pool_host.kv_buffer[1, i, operation.host_indices].copy_(
+                    v[: copy_length],
+                )
+            self.write_buffer_tensors.append(buffer)
             self.mem_pool_host.complete_io(operation.host_indices)
             for node_id in operation.node_ids:
                 if node_id != 0:
