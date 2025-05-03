@@ -993,6 +993,15 @@ class MyScheduler(Scheduler):
                 if self.running_batch is None:
                     ret = None
                 else:
+                    # Check whether the running_batch overflow
+                    if not self.running_batch.check_decode_mem():
+                        keep_indices, remove_indices = self.tree_cache.evict_nowait(
+                            self.running_batch.reqs, len(self.running_batch.reqs)
+                        )
+                        self.waiting_queue.extend([
+                            self.running_batch.reqs[i] for i in remove_indices
+                        ])
+                        self.running_batch.filter_batch(keep_indices=keep_indices)
                     self.running_batch = self.update_running_batch(self.running_batch)
                     ret = self.running_batch
         else:
@@ -1000,11 +1009,20 @@ class MyScheduler(Scheduler):
                 ret = None
             else:
                 # Check whether the running_batch overflow
-                while not self.running_batch.check_decode_mem():
-                    if len(self.running_batch.reqs) == 1:
-                        assert False, "Memory cannot handle even one request"
-                    keep_indices = [i for i in range(len(self.running_batch.reqs))]
-                    self.running_batch.filter_batch(keep_indices)
+                # while not self.running_batch.check_decode_mem():
+                #     print(f"running_batch overflow, available size: {self.token_to_kv_pool.available_size()}, batch size: {len(self.running_batch.reqs)}")
+                #     if len(self.running_batch.reqs) == 1:
+                #         assert False, "Memory cannot handle even one request"
+                #     keep_indices = list(range(len(self.running_batch.reqs) - 1))
+                #     self.running_batch.filter_batch(keep_indices=keep_indices)
+                if not self.running_batch.check_decode_mem():
+                    keep_indices, remove_indices = self.tree_cache.evict_nowait(
+                        self.running_batch.reqs, len(self.running_batch.reqs)
+                    )
+                    self.waiting_queue.extend([
+                        self.running_batch.reqs[i] for i in remove_indices
+                    ])
+                    self.running_batch.filter_batch(keep_indices=keep_indices)
                 try:
                     self.running_batch = self.update_running_batch(self.running_batch)
                 except Exception as e:
