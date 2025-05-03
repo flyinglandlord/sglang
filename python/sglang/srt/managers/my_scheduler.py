@@ -673,10 +673,11 @@ class MyScheduler(Scheduler):
                 # (req, req_len, adjusted_value, 'waiting', True)
                 req_len = len(req.origin_input_ids) + len(req.output_ids) + 1
                 if self.tree_cache.can_load_back(req):
-                    adjust_value = v_token[req] * (self.reschedule_interval - req_len / self.tree_cache.get_loading_workload()[1] - req_len / self.tree_cache.get_writing_workload()[1])
+                    adjust_value = v_token[req] * (self.reschedule_interval - req_len / self.tree_cache.get_loading_workload()[1] - \
+                                                   self.tree_cache.get_writing_workload(req.rid)[0] / self.tree_cache.get_writing_workload(req.rid)[1])
                     waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", False))
                 if self.next_prefill_batch is None or len(self.next_prefill_batch) == 0:
-                    adjust_value = v_token[req] * self.reschedule_interval
+                    adjust_value = v_token[req] * (self.reschedule_interval - write_time)
                     waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", True))
             
             running_queue_evict_candidate = sorted(running_queue_evict_candidate, key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
@@ -691,7 +692,7 @@ class MyScheduler(Scheduler):
             # waiting_queue_run_candidate = [req for idx, req in enumerate(waiting_queue_run_candidate) \
             #                                if self.cum_buffer_size[req[0].rid] <= 2.0 * self.output_speed[req[0].rid]]
             waiting_queue_run_candidate = sorted(waiting_queue_run_candidate, key=lambda x: (
-                (len(x[0].output_ids) == 0), self.cum_buffer_size[x[0].rid], -self.output_speed[x[0].rid], 
+                (len(x[0].output_ids) == 0), -x[2], self.cum_buffer_size[x[0].rid], -self.output_speed[x[0].rid], 
                 self.req_last_run_time[x[0].rid]))
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
