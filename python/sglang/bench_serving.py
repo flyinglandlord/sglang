@@ -58,6 +58,7 @@ class RequestFuncInput:
 @dataclass
 class RequestFuncOutput:
     generated_text: str = ""
+    request_time: float = 0.0
     success: bool = False
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
@@ -168,7 +169,7 @@ async def async_request_openai_completions(
             "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
-            "max_tokens": max(500, request_func_input.output_len),
+            "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
@@ -319,7 +320,7 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
     speed = 40.0
-    # speed = random.choice([40.0, 20.0])
+    # speed = random.choice([40.0, 20.0, 40.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -327,8 +328,8 @@ async def async_request_sglang_generate(
             "sampling_params": {
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-                "output_speed": speed * 3,
+                "ignore_eos": True,
+                "output_speed": speed,
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
@@ -341,7 +342,7 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         output.output_speed = speed
-
+        output.request_time = time.time()
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
