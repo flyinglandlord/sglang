@@ -160,19 +160,17 @@ class SyncChunkCache(ChunkCache):
                     keep_indices.extend(range(i, len(reqs)))
                     break
                 entry: SyncCacheEntry = self.entries[req.rid]
-                if (
-                    entry.value is not None and
-                    not entry.is_synced and
-                    req.rid not in self.req_to_remove and
-                    req.rid not in self.req_to_evict
-                ):
-                    print(f"Evicting {entry.value.shape[0]} tokens from request {req.rid}, "
-                          f"value shape: {entry.value.shape}")
+                if not entry.is_synced:
+                    print(f"Evicting {entry.value.shape[0]} tokens from unsynced request {req.rid}")
+                    self._evict_device(req, entry.value.shape[0])
+                elif self.writing_records[req.rid].empty():
+                    print(f"Evicting {entry.value.shape[0]} tokens from synced request {req.rid}, ")
                     self._evict_device(req, entry.value.shape[0])
                 else:
                     keep_indices.append(i)
         if self.token_to_kv_pool.available_size() < num_tokens:
-            raise RuntimeError(f"Not enough space to evict {num_tokens} tokens")
+            print(f"WARNING: Not enough space to evict {num_tokens} tokens")
+            return [], list(range(len(reqs)))
         remove_indices = [i for i in range(len(reqs)) if i not in keep_indices]
         return keep_indices, remove_indices
 
