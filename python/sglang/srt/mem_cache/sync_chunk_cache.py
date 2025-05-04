@@ -141,12 +141,16 @@ class SyncChunkCache(ChunkCache):
     def evict_device(self, req: Req, seq_len: int):
         # NOTE: Also asynchronized way to evict device memory
         entry: SyncCacheEntry = self.entries.get(req.rid)
-        assert entry is not None, f"Request {req.rid} not in cache"
         with self.entries_lock:
             if entry.is_synced:
                 self._write_host(entry, req, True)
+            if self.kv_selector is not None and len(entry.host_value) != len(entry.full_host_value):
+                self.kv_selector.restore_req(req)
             if req.rid in self.writing_records and not self.writing_records[req.rid].empty():
                 self.req_to_evict[req.rid] = seq_len
+                if entry.written_len > 0:
+                    self._evict_device(req, entry.written_len)
+                    entry.evicted_len = entry.written_len
             else: # evict the request immediately
                 self._evict_device(req, seq_len)
 
@@ -185,7 +189,7 @@ class SyncChunkCache(ChunkCache):
     def get_removing_reqs(self) -> List[str]:
         return list(self.req_to_remove)
 
-    def _evict_device(self, req: Req, evict_len: int) -> bool:
+    def _evict_device(self, req: Req, evict_len: int):
         # evict a request in device memory, but still exist in host memory
         if req.rid not in self.entries:
             raise RuntimeError(f"Request {req.rid} not in cache")
@@ -200,7 +204,7 @@ class SyncChunkCache(ChunkCache):
             value_evict = entry.value[:evict_len]
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
-            return False
+            return
         assert evict_len == entry.value.shape[0], \
             f"Evicting {evict_len} tokens from request {req.rid}, but value shape: {entry.value.shape}"
         if not self.writing_records[req.rid].empty():
@@ -215,7 +219,6 @@ class SyncChunkCache(ChunkCache):
         entry.evicted = True
         req.last_node = entry
         req.req_pool_idx = None
-        return True
 
     def load_back(self, req: Req, load_indices: Optional[List[int]] = None):
         rid = req.rid
@@ -313,12 +316,9 @@ class SyncChunkCache(ChunkCache):
                     else:
                         entry.written_len += write_num
                         if entry.rid in self.req_to_evict:
-                            full_evict = self._evict_device(
+                            self._evict_device(
                                 ack.req, entry.written_len - entry.evicted_len
                             )
-                            assert record.empty() == full_evict, \
-                                f"Request {ack.rid} evicting {entry.written_len - entry.evicted_len} tokens, " \
-                                f"but record {record.empty()} is not empty"
                             entry.evicted_len = entry.written_len
                         if self.kv_selector is not None:
                             self.kv_selector.post_key_cache(

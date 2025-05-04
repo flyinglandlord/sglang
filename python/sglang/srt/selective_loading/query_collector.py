@@ -2,7 +2,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 
 
-ENABLE_QUERY_COLLECTOR = True # or ENABLE_KV_SELECTOR
+ENABLE_QUERY_COLLECTOR = False # or ENABLE_KV_SELECTOR
 SAMPLED_LAYERS = [0]
 
 class SingletonMeta(type):

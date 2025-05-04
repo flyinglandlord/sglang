@@ -243,12 +243,12 @@ class KVSelector:
         mask = mask.expand(self.layer_num, query.shape[2], -1, -1)
         scores = scores.masked_fill(mask == 0, float("-inf"))
         scores = scores.softmax(dim=-1) # do softmax on the key length dimension
-        scores = scores.sum(dim=(0, 1, 2)) # (key_len)
+        scores = scores.sum(dim=(0, 2)) # (head_num, key_len)
         # print(f"KVSelector: compute op {op.rid} scores {scores}")
         if entry.accumu_attn_scores is None:
-            entry.accumu_attn_scores = scores # (key_len)
+            entry.accumu_attn_scores = scores # (head_num, key_len)
         else:
-            scores[:entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
+            scores[:, :entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
         # print(f"KVSelector: compute op {op.rid} scores {entry.accumu_attn_scores}")
         entry.topk_indices = scores.topk(scores.shape[0])[1].tolist()
