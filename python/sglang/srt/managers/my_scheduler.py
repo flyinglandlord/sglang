@@ -93,10 +93,12 @@ class MyScheduleDecision():
         # 默认我们认为调度策略就是沿用之前的running_batch不做任何改变
         self.running_reqs = sorted(self.running_reqs, key=lambda x: self.cum_buffer[x.rid])
         self.avail_tokens -= len(self.running_reqs) * min_generated_num
+        self.avail_running_requests = self.max_prefill_requests
         for req in self.running_reqs:
             if self.can_add_request(req):
                 self.add_request(req)
-        self.avail_running_requests = available_requests
+                self.avail_running_requests -= 1
+        self.avail_running_requests = min(available_requests, self.avail_running_requests)
         self.avail_tokens = available_tokens
 
     def remove_request(self, req):
@@ -606,9 +608,36 @@ class MyScheduler(Scheduler):
         # the larger the cum_buffer_size, the smaller the throughput
         alpha = 1.0
         beta = 0.000001
-        scale = 1.0
+        beta_scale = 1.0
         if self.rebuffer_time is not None and len(self.rebuffer_time) > 0:
-            scale = max(self.rebuffer_time.values()) if max(self.rebuffer_time.values()) > 0 else 1.0
+            beta_scale = max(self.rebuffer_time.values()) if max(self.rebuffer_time.values()) > 0 else 1.0
+
+        # re-scale the self.cum_buffer_size
+        if self.waiting_queue is not None or self.running_batch is not None or len(self.running_batch.reqs) > 0:
+            max_buffer_size = 0
+            min_buffer_size = 20480
+            if self.waiting_queue is not None:
+                for req in self.waiting_queue:
+                    final_buffer_size = self.cum_buffer_size[req.rid] - \
+                        min(self.estimate_load_cost(req), self.estimate_recompute_cost(req)) * self.output_speed[req.rid]
+                    max_buffer_size = max(max_buffer_size, final_buffer_size)
+                    min_buffer_size = min(min_buffer_size, final_buffer_size)
+            
+            if self.running_batch is not None:
+                for req in self.running_batch.reqs:
+                    final_buffer_size =  self.cum_buffer_size[req.rid] - self.output_speed[req.rid] * self.reschedule_interval
+                    max_buffer_size = max(max_buffer_size, final_buffer_size)
+                    min_buffer_size = min(min_buffer_size, final_buffer_size)
+            
+            zp = -min_buffer_size
+            normalize_size = 100
+            if max_buffer_size != min_buffer_size:
+                scale = normalize_size / (max_buffer_size - min_buffer_size)
+            else:
+                scale = normalize_size / min_buffer_size
+        else:
+            zp = 0
+            scale = 1
 
         v_tokens = {}
         if self.waiting_queue is not None:
@@ -617,42 +646,32 @@ class MyScheduler(Scheduler):
                     "Request not in cum_buffer_size, but it should be added when the request is received."
                 final_buffer_size = self.cum_buffer_size[req.rid] - \
                     min(self.estimate_load_cost(req), self.estimate_recompute_cost(req)) * self.output_speed[req.rid]
-                # clamp the buffer size, avoid the overflow error
-                if final_buffer_size < -5: final_buffer_size = -10
-               # final_buffer_size = self.cum_buffer_size[req.rid]
-
-                v_tokens[req] = alpha * math.exp(-final_buffer_size) + beta * self.rebuffer_time[req.rid] / scale
+                # quant the buffer size, avoid the overflow error
+                final_buffer_size = scale * (final_buffer_size + zp)
+                v_tokens[req] = alpha * math.exp(-final_buffer_size) + beta * self.rebuffer_time[req.rid] / beta_scale
         
         if self.running_batch is not None:
             for req in self.running_batch.reqs:
                 assert req.rid in self.cum_buffer_size, \
                     "Request not in cum_buffer_size, but it should be added when the request is received."
                 final_buffer_size =  self.cum_buffer_size[req.rid] - self.output_speed[req.rid] * self.reschedule_interval
-                v_tokens[req] = alpha * math.exp(-final_buffer_size) + beta * self.rebuffer_time[req.rid] / scale
+                # quant the buffer size, avoid the overflow error
+                final_buffer_size = scale * (final_buffer_size + zp)
+                v_tokens[req] = alpha * math.exp(-final_buffer_size) + beta * self.rebuffer_time[req.rid] / beta_scale
         
         return v_tokens
     
     def generate_schedule_decision(self):
         v_token = self.get_token_value()
 
-        max_running_requests = self.max_running_requests
-        if self.running_batch is not None and len(self.running_batch.reqs) > 0:
-            running_buffer_size = []
-            # Check the buffer size in running_batch
-            for req in self.running_batch.reqs:
-                running_buffer_size.append(self.cum_buffer_size[req.rid])
-            avg_running_buffer_size = sum(running_buffer_size) / len(running_buffer_size)
-            if avg_running_buffer_size <= 5:
-                max_running_requests -= 5
-                if max_running_requests <= 1:
-                    max_running_requests = 1
+        max_running_requests = 140
 
         schedule_decision = MyScheduleDecision(self.token_to_kv_pool, self.cum_buffer_size, self.output_speed,
                                             [] if self.running_batch is None else self.running_batch.reqs, 
                                             self.waiting_queue, self.offload_manager.get_all_load_reqs(), self.offload_manager.get_all_evict_reqs(), 
                                             [] if self.next_prefill_batch is None else self.next_prefill_batch,
                                             max_running_requests, self.max_prefill_tokens, 
-                                            max(int(max_running_requests * 0.4), 1), self.new_token_ratio)
+                                            20, self.new_token_ratio)
 
         # Initalize the previous batch, and fill in the free slots
         schedule_decision.initialize_keep_running_list(self.token_to_kv_pool.available_size(), self.req_to_token_pool.available_size())
@@ -667,7 +686,7 @@ class MyScheduler(Scheduler):
             load_time = self.tree_cache.get_loading_workload()[0] / self.tree_cache.get_loading_workload()[1]
             write_time = self.tree_cache.get_writing_workload()[0] / self.tree_cache.get_writing_workload()[1]
             for req in schedule_decision.keep_running_list:
-                if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * (load_time + write_time + self.reschedule_interval):
+                if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * (load_time + write_time):
                     running_queue_evict_candidate.append(req)
             for req in self.waiting_queue:
                 # (req, req_len, adjusted_value, 'waiting', True)
@@ -680,7 +699,8 @@ class MyScheduler(Scheduler):
                     adjust_value = v_token[req] * (self.reschedule_interval - write_time)
                     waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", True))
             
-            running_queue_evict_candidate = sorted(running_queue_evict_candidate, key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
+            running_queue_evict_candidate = sorted(running_queue_evict_candidate, 
+                                                   key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
             #evict_num = int(len(running_queue_evict_candidate))
             #running_queue_evict_candidate = running_queue_evict_candidate[-evict_num:]
 
@@ -843,7 +863,7 @@ class MyScheduler(Scheduler):
                         assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
     
         if (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval):
-            # print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
+            print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
             
             self.last_schedule = time.time()
             if self.running_batch is not None:
