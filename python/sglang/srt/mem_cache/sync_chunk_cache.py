@@ -167,7 +167,9 @@ class SyncChunkCache(ChunkCache):
                     print(f"Evicting {entry.value.shape[0]} tokens from synced request {req.rid}, ")
                     self.token_to_kv_pool_host.free(entry.full_host_value)
                     entry.full_host_value = None
+                    entry.host_value = None
                     entry.is_synced = False
+                    entry.written_len = 0
                     self._evict_device(req, entry.value.shape[0])
                 else:
                     keep_indices.append(i)
