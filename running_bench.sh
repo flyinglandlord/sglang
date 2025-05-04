@@ -15,5 +15,5 @@ rm /mtc/chenjunyi/sglang/tmp/buffer_size.log
     --num-prompts 200 \
     --dataset-name random \
     --dataset-path /home/devsft/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --random-input 2048 --random-output 512 \
-    --sharegpt-output-len 2048 # --profile # --request-rate 10 \
+    --random-input 512 --random-output 2048 \
+    --sharegpt-output-len 2048 --request-rate 10 # --profile #  \
