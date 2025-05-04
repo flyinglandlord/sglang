@@ -195,7 +195,7 @@ class HiCacheController:
             ) for _ in range(self.write_buffer_count + 2)
         ]
         self.load_buffer = TransferBuffer(
-            self.stop_event, buffer_count=10, max_buffer_size=100
+            self.stop_event, buffer_count=3, max_buffer_size=1024
         )
 
         self.write_stream = torch.cuda.Stream()
@@ -467,12 +467,10 @@ class HiCacheController:
             buffer: WriteTensorBuffer = operation.data
             copy_length = len(operation.host_indices)
             for i, (k, v) in enumerate(zip(buffer.k_buffer, buffer.v_buffer)):
-                self.mem_pool_host.kv_buffer[0, i, operation.host_indices].copy_(
-                    k[: copy_length],
-                )
-                self.mem_pool_host.kv_buffer[1, i, operation.host_indices].copy_(
-                    v[: copy_length],
-                )
+                self.mem_pool_host.kv_buffer[0, i, operation.host_indices] = \
+                    k[: copy_length]
+                self.mem_pool_host.kv_buffer[1, i, operation.host_indices] = \
+                    v[: copy_length]
             self.write_buffer_tensors.append(buffer)
             self.mem_pool_host.complete_io(operation.host_indices)
             for node_id in operation.node_ids:
@@ -495,6 +493,7 @@ class HiCacheController:
                     continue
                 start_time = time.time()
                 self.mem_pool_device.transfer(operation.device_indices, operation.data)
+                self.load_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
                 elapsed_time = time.time() - start_time # `transfer` is blocking
                 load_speed = operation.device_indices.shape[0] / elapsed_time

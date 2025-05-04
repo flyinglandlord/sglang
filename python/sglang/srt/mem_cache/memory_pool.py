@@ -275,11 +275,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     @synchronized
     def transfer(self, indices, flat_data):
         # transfer prepared data from host to device
-        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        # flat_data = flat_data.to(device=self.device, non_blocking=False)
         k_data, v_data = flat_data[0], flat_data[1]
+        # for i in range(self.layer_num):
+        #     self.k_buffer[i][indices] = k_data[i]
+        #     self.v_buffer[i][indices] = v_data[i]
+        k_list = [k[indices] for k in self.k_buffer]
+        v_list = [v[indices] for v in self.v_buffer]
         for i in range(self.layer_num):
-            self.k_buffer[i][indices] = k_data[i]
-            self.v_buffer[i][indices] = v_data[i]
+            k_list[i].copy_(k_data[i], non_blocking=True)
+            v_list[i].copy_(v_data[i], non_blocking=True)
 
     @synchronized
     def get_key_buffer(self, layer_id: int):

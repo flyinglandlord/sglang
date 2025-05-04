@@ -53,7 +53,7 @@ class KVSelectEntry:
 
 
 class KVSelector:
-    def __init__(self, head_num: int, head_dim: int, k_buffer: torch.Tensor):
+    def __init__(self, head_num: int, head_dim: int, kv_buffer: torch.Tensor):
         self.entries: Dict[str, KVSelectEntry] = {}
         self.compute_op_count: Dict[str, int] = {}
         self.finished_reqs: Set[str] = set()
@@ -67,7 +67,7 @@ class KVSelector:
         self.layer_num = len(SAMPLED_LAYERS)
         # NOTE: this `detach` is important, otherwise pytorch would block other threads
         #       from accessing the key buffer
-        self.k_buffer = k_buffer.detach()
+        self.kv_buffer = kv_buffer.detach()
     
     def reset(self):
         self.stop_event.set()
@@ -228,7 +228,9 @@ class KVSelector:
             return
         # do self-attention computation on CPU
         query = op.query.view(self.layer_num, op.query.shape[1], -1, self.head_dim)
-        key = self.k_buffer[SAMPLED_LAYERS][:, op.key_indices]
+        key = torch.stack(
+            [self.kv_buffer[0, layer, op.key_indices] for layer in SAMPLED_LAYERS], dim=0
+        )
         key = key.repeat_interleave(query.shape[2] // key.shape[2], dim=2)
         time_start = time.time()
         # compute attention scores
@@ -242,13 +244,14 @@ class KVSelector:
         scores = scores.masked_fill(mask == 0, float("-inf"))
         scores = scores.softmax(dim=-1) # do softmax on the key length dimension
         scores = scores.sum(dim=(0, 1, 2)) # (key_len)
+        # print(f"KVSelector: compute op {op.rid} scores {scores}")
         if entry.accumu_attn_scores is None:
             entry.accumu_attn_scores = scores # (key_len)
         else:
             scores[:entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
-        _, topk_indices = scores.topk(scores.shape[0])
-        entry.topk_indices = topk_indices.tolist()
+        # print(f"KVSelector: compute op {op.rid} scores {entry.accumu_attn_scores}")
+        entry.topk_indices = scores.topk(scores.shape[0])[1].tolist()
         elapsed_time = time.time() - time_start
         entry.total_compute_time += elapsed_time
         entry.last_compute_time = elapsed_time

@@ -76,7 +76,7 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector = KVSelector(
                 self.token_to_kv_pool.head_num,
                 self.token_to_kv_pool.head_dim,
-                self.token_to_kv_pool_host.kv_buffer[0],
+                self.token_to_kv_pool_host.kv_buffer,
             )
         return self.kv_selector
 
@@ -212,7 +212,6 @@ class SyncChunkCache(ChunkCache):
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
-        entry.host_value = None
         entry.evicted = True
         req.last_node = entry
         req.req_pool_idx = None
@@ -325,12 +324,12 @@ class SyncChunkCache(ChunkCache):
                             self.kv_selector.post_key_cache(
                                 ack.rid, entry.full_host_value, write_num
                             )
-            if record.empty():
-                if ack.rid in self.req_to_evict:
-                    del self.req_to_evict[ack.rid]
-                elif ack.rid in self.req_to_remove:
-                    self.req_to_remove.remove(ack.rid)
-                    del self.writing_records[ack.rid]
+                if record.empty():
+                    if ack.rid in self.req_to_evict:
+                        del self.req_to_evict[ack.rid]
+                    elif ack.rid in self.req_to_remove:
+                        self.req_to_remove.remove(ack.rid)
+                        del self.writing_records[ack.rid]
 
     def can_load_back(self, req: Req) -> bool:
         # check if the request can be loaded back
@@ -363,6 +362,8 @@ class SyncChunkCache(ChunkCache):
         else:
             host_len = len(entry.host_value)
             sync_len = len(entry.value) - host_len
+            assert sync_len >= 0, \
+                f"Request {req.rid} sync_len {sync_len} < 0, host_len {host_len}, value shape {entry.value.shape}"
             if sync_len == 0:
                 return # no need to write
             device_indices = entry.value[host_len: host_len + sync_len]
@@ -403,7 +404,8 @@ class SyncChunkCache(ChunkCache):
             entry.evicted = False
             entry.evicted_len = 0
             if entry.full_host_value is not None:
-                entry.host_value = entry.full_host_value
+                if entry.host_value is None:
+                    entry.host_value = entry.full_host_value
                 self.token_to_kv_pool_host.update_synced(entry.host_value)
                 entry.written_len = len(entry.host_value)
         if entry.is_synced and len(entry.value) - len(entry.host_value) >= self.sync_chunk_size:
