@@ -216,6 +216,7 @@ class SyncChunkCache(ChunkCache):
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
+        entry.host_value = None
         entry.evicted = True
         req.last_node = entry
         req.req_pool_idx = None
@@ -276,7 +277,6 @@ class SyncChunkCache(ChunkCache):
             print(f"WARNING: No kv selected for request {req.rid}, loading all")
             self.kv_selector.restore_req(req)
             return self.load_back(req)
-        print(f"Request {req.rid} selected kv {len(indices)} for loading")
         self.load_back(req, indices)
 
     def load_check(self, req: Optional[Req] = None) -> Optional[bool]:

@@ -282,7 +282,10 @@ class MyRequestOffloadManager():
             for req in self.load_queue:
                 if self.is_req_ready_to_load(req[0]):
                     # assert self.sync_cache.can_load_back(req[0]), "A request cannot loadback in the Offload Manager"
-                    self.sync_cache.load_back(req[0])
+                    if len(req[0].output_ids) < 100:
+                        self.sync_cache.load_back(req[0])
+                    else:
+                        self.sync_cache.select_and_load_back(req[0], 900, True)
                     filtered_in_load_queue.append(req)
             for req in filtered_in_load_queue:
                 self.load_queue.remove(req)
@@ -699,6 +702,11 @@ class MyScheduler(Scheduler):
             # self.local_search(schedule_decision, v_token)
 
         self.greedy_selection(schedule_decision, valid_thr)
+
+        for req in schedule_decision.keep_running_list:
+            if len(req.origin_input_ids) + len(req.output_ids) > 1000 and len(req.output_ids) > 100:
+                print(f"evict {req.rid} for too long: {len(req.origin_input_ids)} {len(req.output_ids)}")
+                schedule_decision.remove_request(req)
 
         print('valid_thr', valid_thr, file=open('tmp/buffer_size.log', 'a'))
         for req in valid_thr.keys():

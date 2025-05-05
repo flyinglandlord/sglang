@@ -13,7 +13,7 @@ from sglang.srt.selective_loading.query_collector import QueryCollector, SAMPLED
 logger = logging.getLogger(__name__)
 
 NUM_TORCH_SUBPROCESSES = 32
-STATIC_KV_LEN = 32
+STATIC_KV_LEN = 128
 
 
 @dataclass
@@ -26,7 +26,7 @@ class KVSelectOperation:
 class KVSelectEntry:
     def __init__(self, rid: str, input_ids: Tuple[int], output_ids: List[int]):
         self.rid = rid
-        self.fill_ids: List[int] = input_ids + output_ids
+        self.fill_ids: List[int] = list(input_ids) + output_ids
         self.originial_input_len: int = len(input_ids)
         self.accumu_length: int = 0
         self.last_compute_time: float = 0.0
@@ -39,10 +39,12 @@ class KVSelectEntry:
     def update_output_ids(self, req: Req):
         assert req.rid == self.rid, f"Request ID mismatch: {req.rid} != {self.rid}"
         num_token_new = len(req.origin_input_ids) + len(req.output_ids) - self.last_length
+        if num_token_new == 0:
+            return # no new tokens
+        self.fill_ids.extend(req.output_ids[-num_token_new:])
         assert len(req.output_ids) >= num_token_new >= 0, \
             f"Invalid token update: {num_token_new} new tokens, " \
             f"output_ids length {len(req.output_ids)}, last_length {self.last_length}"
-        self.fill_ids.extend(req.output_ids[-num_token_new:])
         self.last_length += num_token_new
     
     def restore_req(self, req: Req):
@@ -53,7 +55,11 @@ class KVSelectEntry:
 
 
 class KVSelector:
-    def __init__(self, head_num: int, head_dim: int, kv_buffer: torch.Tensor):
+    def __init__(
+            self, 
+            head_num: int, head_dim: int, 
+            kv_buffer: torch.Tensor,
+        ):
         self.entries: Dict[str, KVSelectEntry] = {}
         self.compute_op_count: Dict[str, int] = {}
         self.finished_reqs: Set[str] = set()
@@ -93,7 +99,6 @@ class KVSelector:
                 if req.rid not in req_to_remove:
                     entry: KVSelectEntry = self.entries.get(req.rid)
                     if entry is not None: # recompute, update the entry the same way as decode
-                        entry.update_output_ids(req)
                         seq_end_pos = cunum_tokens + req.extend_input_len
                         query = queries[:, seq_end_pos - 1:seq_end_pos]
                     else:
@@ -107,7 +112,6 @@ class KVSelector:
                 entry: KVSelectEntry = self.entries.get(req.rid)
                 if entry is None or req.rid in req_to_remove:
                     continue # this request have already finished
-                entry.update_output_ids(req)
                 entry.cached_queries.append(queries[:, i:i + 1])
 
     def post_key_cache(self, rid: str, key_indices: torch.Tensor, write_num: int) -> None:
@@ -133,8 +137,9 @@ class KVSelector:
         self.compute_op_count[rid] = self.compute_op_count.get(rid, 0) + write_num
 
     def restore_req(self, req: Req) -> None:
-        if req.rid in self.entries:
-            self.entries[req.rid].restore_req(req)
+        if entry := self.entries.get(req.rid):
+            entry.update_output_ids(req)
+            entry.restore_req(req)
         else:
             logger.warning(f"Request {req.rid} not found in KVSelectEntry, ignoring restore")
     
@@ -158,6 +163,7 @@ class KVSelector:
     
     def select_kv(self, req: Req, target_length: int) -> Optional[List[int]]:
         entry: KVSelectEntry = self.entries.get(req.rid)
+        entry.update_output_ids(req)
         if entry is None or entry.topk_indices is None:
             return None
         topk_indices = entry.topk_indices
@@ -184,9 +190,13 @@ class KVSelector:
             f"Invalid token selection: {len(req.origin_input_ids)} + {len(req.output_ids)} " \
             f"!= {target_length + 1}, rid {req.rid}, input_pos {input_pos}"
         entry.last_length = target_length + 1
+        print(f"KVSelector: rid {req.rid}, full length {full_length}, "
+              f"cur input len {len(req.origin_input_ids)}, cur output len {len(req.output_ids)}")
         print(f"req {req.rid} indices len {len(indices)}, full length {full_length}, "
               f"originial input len {entry.originial_input_len}, input pos {input_pos}, "
-              f"cur input len {len(req.origin_input_ids)}, cur output len {len(req.output_ids)}")
+              f"cur input len {len(req.origin_input_ids)}, cur output len {len(req.output_ids)}\n"
+              f"indices {indices}",
+            file=open("tmp/kv_selector.log", "a"))
         return indices
 
     def req_finished(self, rid: str) -> None:
@@ -237,18 +247,18 @@ class KVSelector:
         scores = torch.einsum("lqhd,lkhd->lhqk", query, key) / (self.head_dim ** 0.5)
         scores = scores.to(dtype=torch.float32)
         mask = torch.tril(
-            torch.ones((query.shape[1], key.shape[1]), dtype=torch.int8),
+            torch.ones((query.shape[1], key.shape[1]), dtype=torch.bool),
             diagonal=key.shape[1] - query.shape[1],
         )
         mask = mask.expand(self.layer_num, query.shape[2], -1, -1)
-        scores = scores.masked_fill(mask == 0, float("-inf"))
+        scores = scores.masked_fill(mask.logical_not(), float("-inf"))
         scores = scores.softmax(dim=-1) # do softmax on the key length dimension
-        scores = scores.sum(dim=(0, 2)) # (head_num, key_len)
+        scores = scores.sum(dim=(0, 1, 2)) # (key_len)
         # print(f"KVSelector: compute op {op.rid} scores {scores}")
         if entry.accumu_attn_scores is None:
-            entry.accumu_attn_scores = scores # (head_num, key_len)
+            entry.accumu_attn_scores = scores # (key_len)
         else:
-            scores[:, :entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
+            scores[:entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
         # print(f"KVSelector: compute op {op.rid} scores {entry.accumu_attn_scores}")
         entry.topk_indices = scores.topk(scores.shape[0])[1].tolist()
