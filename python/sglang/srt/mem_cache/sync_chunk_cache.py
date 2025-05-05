@@ -76,7 +76,7 @@ class SyncChunkCache(ChunkCache):
             self.kv_selector = KVSelector(
                 self.token_to_kv_pool.head_num,
                 self.token_to_kv_pool.head_dim,
-                self.token_to_kv_pool_host.kv_buffer[0],
+                self.token_to_kv_pool_host.kv_buffer,
             )
         return self.kv_selector
 
@@ -141,12 +141,16 @@ class SyncChunkCache(ChunkCache):
     def evict_device(self, req: Req, seq_len: int):
         # NOTE: Also asynchronized way to evict device memory
         entry: SyncCacheEntry = self.entries.get(req.rid)
-        assert entry is not None, f"Request {req.rid} not in cache"
         with self.entries_lock:
             if entry.is_synced:
                 self._write_host(entry, req, True)
+            if self.kv_selector is not None and len(entry.host_value) != len(entry.full_host_value):
+                self.kv_selector.restore_req(req)
             if req.rid in self.writing_records and not self.writing_records[req.rid].empty():
                 self.req_to_evict[req.rid] = seq_len
+                if entry.written_len > 0:
+                    self._evict_device(req, entry.written_len)
+                    entry.evicted_len = entry.written_len
             else: # evict the request immediately
                 self._evict_device(req, seq_len)
 
@@ -167,7 +171,9 @@ class SyncChunkCache(ChunkCache):
                     print(f"Evicting {entry.value.shape[0]} tokens from synced request {req.rid}, ")
                     self.token_to_kv_pool_host.free(entry.full_host_value)
                     entry.full_host_value = None
+                    entry.host_value = None
                     entry.is_synced = False
+                    entry.written_len = 0
                     self._evict_device(req, entry.value.shape[0])
                 else:
                     keep_indices.append(i)
@@ -183,7 +189,7 @@ class SyncChunkCache(ChunkCache):
     def get_removing_reqs(self) -> List[str]:
         return list(self.req_to_remove)
 
-    def _evict_device(self, req: Req, evict_len: int) -> bool:
+    def _evict_device(self, req: Req, evict_len: int):
         # evict a request in device memory, but still exist in host memory
         if req.rid not in self.entries:
             raise RuntimeError(f"Request {req.rid} not in cache")
@@ -198,7 +204,7 @@ class SyncChunkCache(ChunkCache):
             value_evict = entry.value[:evict_len]
             self.token_to_kv_pool.free(value_evict)
             entry.value = entry.value[evict_len:]
-            return False
+            return
         assert evict_len == entry.value.shape[0], \
             f"Evicting {evict_len} tokens from request {req.rid}, but value shape: {entry.value.shape}"
         if not self.writing_records[req.rid].empty():
@@ -210,11 +216,9 @@ class SyncChunkCache(ChunkCache):
         self.token_to_kv_pool.free(entry.value)
         self.req_to_token_pool.free(req.req_pool_idx)
         entry.value = None
-        entry.host_value = None
         entry.evicted = True
         req.last_node = entry
         req.req_pool_idx = None
-        return True
 
     def load_back(self, req: Req, load_indices: Optional[List[int]] = None):
         rid = req.rid
@@ -312,23 +316,20 @@ class SyncChunkCache(ChunkCache):
                     else:
                         entry.written_len += write_num
                         if entry.rid in self.req_to_evict:
-                            full_evict = self._evict_device(
+                            self._evict_device(
                                 ack.req, entry.written_len - entry.evicted_len
                             )
-                            assert record.empty() == full_evict, \
-                                f"Request {ack.rid} evicting {entry.written_len - entry.evicted_len} tokens, " \
-                                f"but record {record.empty()} is not empty"
                             entry.evicted_len = entry.written_len
                         if self.kv_selector is not None:
                             self.kv_selector.post_key_cache(
                                 ack.rid, entry.full_host_value, write_num
                             )
-            if record.empty():
-                if ack.rid in self.req_to_evict:
-                    del self.req_to_evict[ack.rid]
-                elif ack.rid in self.req_to_remove:
-                    self.req_to_remove.remove(ack.rid)
-                    del self.writing_records[ack.rid]
+                if record.empty():
+                    if ack.rid in self.req_to_evict:
+                        del self.req_to_evict[ack.rid]
+                    elif ack.rid in self.req_to_remove:
+                        self.req_to_remove.remove(ack.rid)
+                        del self.writing_records[ack.rid]
 
     def can_load_back(self, req: Req) -> bool:
         # check if the request can be loaded back
@@ -361,6 +362,8 @@ class SyncChunkCache(ChunkCache):
         else:
             host_len = len(entry.host_value)
             sync_len = len(entry.value) - host_len
+            assert sync_len >= 0, \
+                f"Request {req.rid} sync_len {sync_len} < 0, host_len {host_len}, value shape {entry.value.shape}"
             if sync_len == 0:
                 return # no need to write
             device_indices = entry.value[host_len: host_len + sync_len]
@@ -401,7 +404,8 @@ class SyncChunkCache(ChunkCache):
             entry.evicted = False
             entry.evicted_len = 0
             if entry.full_host_value is not None:
-                entry.host_value = entry.full_host_value
+                if entry.host_value is None:
+                    entry.host_value = entry.full_host_value
                 self.token_to_kv_pool_host.update_synced(entry.host_value)
                 entry.written_len = len(entry.host_value)
         if entry.is_synced and len(entry.value) - len(entry.host_value) >= self.sync_chunk_size:

@@ -491,36 +491,36 @@ class Scheduler:
             self.cur_batch = batch
 
             if batch:
-                for req in batch.reqs:
-                    if (batch.decoding_reqs is not None and req not in batch.decoding_reqs) or batch.decoding_reqs is None:
-                        print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
-                print('', file=open('tmp/batch_detail.txt', 'a'))
-                if batch.decoding_reqs is not None:
-                    for req in batch.decoding_reqs:
-                        print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
-                print('', file=open('tmp/batch_detail.txt', 'a'))
-                # 2025.03.10: add the waiting queue information
-                if self.waiting_queue is not None:
-                    for req in self.waiting_queue:
-                        print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
-                print('', file=open('tmp/batch_detail.txt', 'a'))
-                if batch.forward_mode.is_mixed():
-                    print(f"mixed: {len(batch.decoding_reqs)} {len(batch.reqs) - len(batch.decoding_reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ', file=open('tmp/batch_info.txt', 'a'))
-                elif batch.forward_mode.is_extend():
-                    print(f"extend: {0} {len(batch.reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ', file=open('tmp/batch_info.txt', 'a'))
-                elif batch.forward_mode.is_decode():
-                    print(f"decode: {len(batch.reqs)} {0} {batch.seq_lens_sum} {len(batch.reqs)}", end=' ', file=open('tmp/batch_info.txt', 'a'))
+                # for req in batch.reqs:
+                #     if (batch.decoding_reqs is not None and req not in batch.decoding_reqs) or batch.decoding_reqs is None:
+                #         print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                # print('', file=open('tmp/batch_detail.txt', 'a'))
+                # if batch.decoding_reqs is not None:
+                #     for req in batch.decoding_reqs:
+                #         print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                # print('', file=open('tmp/batch_detail.txt', 'a'))
+                # # 2025.03.10: add the waiting queue information
+                # if self.waiting_queue is not None:
+                #     for req in self.waiting_queue:
+                #         print(f'{req.rid}', end=' ', file=open('tmp/batch_detail.txt', 'a'))
+                # print('', file=open('tmp/batch_detail.txt', 'a'))
+                # if batch.forward_mode.is_mixed():
+                #     print(f"mixed: {len(batch.decoding_reqs)} {len(batch.reqs) - len(batch.decoding_reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ', file=open('tmp/batch_info.txt', 'a'))
+                # elif batch.forward_mode.is_extend():
+                #     print(f"extend: {0} {len(batch.reqs)} {sum(batch.prefix_lens)} {batch.extend_num_tokens}", end=' ', file=open('tmp/batch_info.txt', 'a'))
+                # elif batch.forward_mode.is_decode():
+                #     print(f"decode: {len(batch.reqs)} {0} {batch.seq_lens_sum} {len(batch.reqs)}", end=' ', file=open('tmp/batch_info.txt', 'a'))
                 
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
                 st = time.time()
 
                 result = self.run_batch(batch)
 
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
                 ed = time.time()
                 time_stamp += ed - st
-                print(f"{ed - st} {time_stamp}", file=open('tmp/batch_detail.txt', 'a'))
-                print(f"{ed - st}", file=open('tmp/batch_info.txt', 'a'))
+                # print(f"{ed - st} {time_stamp}", file=open('tmp/batch_detail.txt', 'a'))
+                # print(f"{ed - st}", file=open('tmp/batch_info.txt', 'a'))
 
                 self.process_batch_result(batch, result)
             else:

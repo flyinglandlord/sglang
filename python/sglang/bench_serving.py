@@ -319,8 +319,8 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
-    speed = 40.0
-    # speed = random.choice([40.0, 20.0, 40.0])
+    # speed = 20.0
+    speed = random.choice([30.0, 30.0, 30.0, 30.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
