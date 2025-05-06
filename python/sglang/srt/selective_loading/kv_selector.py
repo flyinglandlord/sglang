@@ -1,10 +1,11 @@
 import time
 import torch
+from torch.nn.functional import cosine_similarity
 import logging
 import threading
 from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Dict, Set, List, Tuple, Optional
+from typing import Dict, Set, List, Tuple, Optional, Callable
 from queue import Empty, Full, Queue
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -32,9 +33,10 @@ class KVSelectEntry:
         self.last_compute_time: float = 0.0
         self.total_compute_time: float = 0.0
         self.accumu_attn_scores: Optional[torch.Tensor] = None
-        self.topk_indices: Optional[List[int]] = None
+        self.compressed_indices: Optional[torch.Tensor] = None
         self.last_length: int = len(self.fill_ids)
         self.cached_queries: List[torch.Tensor] = []
+        self.compress_ratio: float = 0.75
     
     def update_output_ids(self, req: Req):
         assert req.rid == self.rid, f"Request ID mismatch: {req.rid} != {self.rid}"
@@ -59,6 +61,8 @@ class KVSelector:
             self, 
             head_num: int, head_dim: int, 
             kv_buffer: torch.Tensor,
+            host_alloc: Callable[[int], torch.Tensor] = None,
+            host_free: Callable[[torch.Tensor], int] = None,
         ):
         self.entries: Dict[str, KVSelectEntry] = {}
         self.compute_op_count: Dict[str, int] = {}
@@ -74,6 +78,8 @@ class KVSelector:
         # NOTE: this `detach` is important, otherwise pytorch would block other threads
         #       from accessing the key buffer
         self.kv_buffer = kv_buffer.detach()
+        self.host_alloc = host_alloc
+        self.host_free = host_free
     
     def reset(self):
         self.stop_event.set()
@@ -85,6 +91,29 @@ class KVSelector:
         self.stop_event.clear()
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
+    
+    def set_compress_ratio(self, rid: str, ratio: float) -> None:
+        if entry := self.entries.get(rid):
+            entry.compress_ratio = ratio
+            if entry.compressed_indices is not None:
+                # recompute the compressed indices
+                self.host_free(entry.compressed_indices)
+                entry.compressed_indices = None
+        else:
+            logger.warning(f"Request {rid} not found in KVSelectEntry, ignoring compress ratio update")
+    
+    def get_compressed_indices(self, req: Req, recent_len: int) -> Optional[torch.Tensor]:
+        if entry := self.entries.get(req.rid):
+            entry.update_output_ids(req)
+            if entry.compressed_indices is not None:
+                indices = entry.compressed_indices
+                fill_ids = entry.fill_ids[:len(indices) + recent_len]
+                req.origin_input_ids = fill_ids[:len(indices)]
+                req.output_ids = fill_ids[-recent_len:]
+                req.output_ids.append(entry.fill_ids[-1])
+                entry.last_length = len(fill_ids) + 1
+                return indices
+        return None
 
     def update_with_batch(self, batch: ScheduleBatch, req_to_remove: Set[str]) -> None:
         """NOTE: The query tensors captured by QueryCollector are not associated
@@ -150,54 +179,16 @@ class KVSelector:
                 return False
         return False
 
-    def wait_for_ready(self, req: Req, target_length: int) -> bool:
+    def wait_for_ready(self, req: Req) -> bool:
         if req.rid in self.entries:
             entry: KVSelectEntry = self.entries[req.rid]
-            while entry.accumu_attn_scores is None and not self.stop_event.is_set():
+            while entry.compressed_indices is None and not self.stop_event.is_set():
                 print(f"wait for kv selecting for req {req.rid}")
                 time.sleep(0.5)
             return True
         else:
             logger.warning(f"Request {req.rid} not found in KVSelectEntry, ignoring wait")
         return False
-    
-    def select_kv(self, req: Req, target_length: int) -> Optional[List[int]]:
-        entry: KVSelectEntry = self.entries.get(req.rid)
-        entry.update_output_ids(req)
-        if entry is None or entry.topk_indices is None:
-            return None
-        topk_indices = entry.topk_indices
-        full_length = len(entry.fill_ids) - 1
-        if full_length < 2 * STATIC_KV_LEN:
-            return None
-        max_topk_length = target_length - 2 * STATIC_KV_LEN
-        indices = []
-        for i in topk_indices:
-            if STATIC_KV_LEN <= i and i < full_length - STATIC_KV_LEN:
-                indices.append(i)
-            if len(indices) >= max_topk_length:
-                break
-        keep_length = target_length - len(indices)
-        indices.sort()
-        indices = list(range(STATIC_KV_LEN)) + indices
-        indices.extend(range(full_length - keep_length + STATIC_KV_LEN, full_length))
-        input_pos = bisect_left(indices, entry.originial_input_len)
-        req.origin_input_ids = [entry.fill_ids[i] for i in indices[:input_pos]]
-        new_token = req.output_ids[-1]
-        req.output_ids = [entry.fill_ids[i] for i in indices[input_pos:]]
-        req.output_ids.append(new_token)
-        assert len(req.origin_input_ids) + len(req.output_ids) == target_length + 1, \
-            f"Invalid token selection: {len(req.origin_input_ids)} + {len(req.output_ids)} " \
-            f"!= {target_length + 1}, rid {req.rid}, input_pos {input_pos}"
-        entry.last_length = target_length + 1
-        print(f"KVSelector: rid {req.rid}, full length {full_length}, "
-              f"cur input len {len(req.origin_input_ids)}, cur output len {len(req.output_ids)}")
-        print(f"req {req.rid} indices len {len(indices)}, full length {full_length}, "
-              f"originial input len {entry.originial_input_len}, input pos {input_pos}, "
-              f"cur input len {len(req.origin_input_ids)}, cur output len {len(req.output_ids)}\n"
-              f"indices {indices}",
-            file=open("tmp/kv_selector.log", "a"))
-        return indices
 
     def req_finished(self, rid: str) -> None:
         if rid in self.compute_op_count:
@@ -205,8 +196,11 @@ class KVSelector:
                 self.finished_reqs.add(rid) # mark as finished
             else:
                 del self.compute_op_count[rid]
-        if rid in self.entries:
+        if entry := self.entries.get(rid):
             del self.entries[rid]
+            if entry.compressed_indices is not None:
+                self.host_free(entry.compressed_indices)
+                entry.compressed_indices = None
 
     def _worker(self) -> None:
         torch.set_num_threads(NUM_TORCH_SUBPROCESSES)
@@ -236,14 +230,13 @@ class KVSelector:
         entry: KVSelectEntry = self.entries.get(op.rid)
         if entry is None:
             return
-        # do self-attention computation on CPU
+        # PHASE1: do self-attention computation on CPU
         query = op.query.view(self.layer_num, op.query.shape[1], -1, self.head_dim)
         key = torch.stack(
             [self.kv_buffer[0, layer, op.key_indices] for layer in SAMPLED_LAYERS], dim=0
         )
         key = key.repeat_interleave(query.shape[2] // key.shape[2], dim=2)
         time_start = time.time()
-        # compute attention scores
         scores = torch.einsum("lqhd,lkhd->lhqk", query, key) / (self.head_dim ** 0.5)
         scores = scores.to(dtype=torch.float32)
         mask = torch.tril(
@@ -261,7 +254,62 @@ class KVSelector:
             scores[:entry.accumu_attn_scores.shape[0]] += entry.accumu_attn_scores
             entry.accumu_attn_scores = scores
         # print(f"KVSelector: compute op {op.rid} scores {entry.accumu_attn_scores}")
-        entry.topk_indices = scores.topk(scores.shape[0])[1].tolist()
+
+        # PHASE2: token merging
+        compressed_len = len(entry.compressed_indices) if entry.compressed_indices is not None else 0
+        scores = scores[compressed_len:]
+        key_indices = op.key_indices[compressed_len:]
+        scores = (scores / scores.sum()).tolist()
+        if len(scores) < 512:
+            return
+        budget_len = max(int(len(scores) * entry.compress_ratio), 1)
+        new_indices = self.host_alloc(budget_len)
+        for layer_idx in range(self.kv_buffer.shape[1]):
+            compressed_kv = [self.kv_buffer[:, layer_idx, idx].view(2, self.head_num * self.head_dim) 
+                             for idx in key_indices]
+            cur_scores = scores
+            cos_similiarity_threshold = 0.9
+            while len(compressed_kv) > budget_len and cos_similiarity_threshold >= 0.8:
+                new_compressed_kv = [compressed_kv[0]]
+                new_scores = [cur_scores[0]]
+                assert len(compressed_kv) == len(cur_scores), \
+                    f"KVSelector: compute op {op.rid} layer {layer_idx} compressed kv length {len(compressed_kv)} " \
+                    f"and cur_scores length {len(cur_scores)} mismatch"
+                for i in range(1, len(compressed_kv)):
+                    similarity = cosine_similarity(
+                        new_compressed_kv[-1][0], compressed_kv[i][0], dim=-1
+                    ).item()
+                    if similarity >= cos_similiarity_threshold:
+                        ratio = new_scores[-1] / (new_scores[-1] + cur_scores[i])
+                        new_scores[-1] += cur_scores[i]
+                        new_compressed_kv[-1] = ratio * new_compressed_kv[-1] + \
+                            (1 - ratio) * compressed_kv[i]
+                    else:
+                        new_compressed_kv.append(compressed_kv[i])
+                        new_scores.append(cur_scores[i])
+                # print(f"KVSelector: compute op {op.rid} layer {layer_idx} "
+                #       f": {len(compressed_kv)} -> {len(new_compressed_kv)}, "
+                #       f"threshold {cos_similiarity_threshold:.2f}", file=open("tmp/kv_selector.log", "a"))
+                # update the compressed kv
+                if len(new_compressed_kv) < budget_len:
+                    break
+                compressed_kv = new_compressed_kv
+                cur_scores = new_scores
+                cos_similiarity_threshold -= 0.03
+            if len(compressed_kv) > budget_len:
+                # select the top-k tokens
+                topk_indices = sorted(range(len(compressed_kv)), key=lambda i: cur_scores[i], reverse=True)[:budget_len]
+                compressed_kv = [compressed_kv[i] for i in topk_indices]
+            if op.rid not in self.entries:
+                self.host_free(new_indices)
+                logger.warning(f"Request {op.rid} not found in KVSelectEntry, ignoring compute op")
+                return
+            self.kv_buffer[:, layer_idx, new_indices] = torch.stack(
+                compressed_kv, dim=1).view(2, budget_len, self.head_num, self.head_dim)
+        if entry.compressed_indices is not None:
+            new_indices = torch.cat([entry.compressed_indices, new_indices], dim=0)
+        entry.compressed_indices = new_indices
+
         elapsed_time = time.time() - time_start
         entry.total_compute_time += elapsed_time
         entry.last_compute_time = elapsed_time

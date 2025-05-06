@@ -30,6 +30,7 @@ class SyncCacheEntry(ChunkCacheEntry):
         self.evicted_len: int = 0
         self.written_len: int = 0
         self.seq_len: int = 0
+        self.compressed_len: int = 0
         self.is_synced: bool = True
         self.full_host_value: Optional[torch.Tensor] = None
 
@@ -38,7 +39,7 @@ class SyncChunkCache(ChunkCache):
         self, 
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: MHATokenToKVPool,
-        sync_chunk_size: int = 32,
+        sync_chunk_size: int = 64,
     ):
         assert isinstance(token_to_kv_pool, MHATokenToKVPool), \
             f"token_to_kv_pool must be MHATokenToKVPool, but got {type(req_to_token_pool)}"
@@ -77,6 +78,8 @@ class SyncChunkCache(ChunkCache):
                 self.token_to_kv_pool.head_num,
                 self.token_to_kv_pool.head_dim,
                 self.token_to_kv_pool_host.kv_buffer,
+                self.token_to_kv_pool_host.alloc,
+                self.token_to_kv_pool_host.free,
             )
         return self.kv_selector
 
@@ -146,6 +149,7 @@ class SyncChunkCache(ChunkCache):
                 self._write_host(entry, req, True)
             if self.kv_selector is not None and len(entry.host_value) != len(entry.full_host_value):
                 self.kv_selector.restore_req(req)
+                entry.host_value = entry.host_value[entry.compressed_len:]
             if req.rid in self.writing_records and not self.writing_records[req.rid].empty():
                 self.req_to_evict[req.rid] = seq_len
                 if entry.written_len > 0:
@@ -221,7 +225,7 @@ class SyncChunkCache(ChunkCache):
         req.last_node = entry
         req.req_pool_idx = None
 
-    def load_back(self, req: Req, load_indices: Optional[List[int]] = None):
+    def load_back(self, req: Req, host_value: Optional[torch.Tensor] = None):
         rid = req.rid
         with self.entries_lock:
             entry: SyncCacheEntry = self.entries.get(rid)
@@ -232,11 +236,8 @@ class SyncChunkCache(ChunkCache):
             if not self.writing_records[req.rid].empty():
                 raise RuntimeError(f"Request {rid} is writing")
             # load the device memory
-            host_value = entry.full_host_value
-            if load_indices is not None:
-                host_value = host_value[load_indices]
-                assert host_value.shape[0] == len(load_indices), \
-                    f"host_value {host_value.shape[0]} != load_indices {len(load_indices)}"
+            if host_value is None:
+                host_value = entry.full_host_value
             entry.host_value = host_value
             device_indices = self.cache_controller.load(host_value, node_id=entry)
             if device_indices is None:
@@ -263,21 +264,26 @@ class SyncChunkCache(ChunkCache):
         entry: SyncCacheEntry = self.entries[rid]
         return max(entry.last_writing_pos - self.wrote_token_num, 0), self.write_speed
     
-    def select_and_load_back(self, req: Req, target_length: int, wait: bool = False):
+    def load_back_selective(self, req: Req, wait: bool = False):
         if self.kv_selector is None:
             return self.load_back(req)
         entry: SyncCacheEntry = self.entries.get(req.rid)
         assert entry is not None, f"Request {req.rid} not in cache"
-        if target_length > entry.full_host_value.shape[0]:
-            return self.load_back(req)
         if wait:
-            self.kv_selector.wait_for_ready(req, target_length)
-        indices = self.kv_selector.select_kv(req, target_length)
+            self.kv_selector.wait_for_ready(req)
+        recent_len = 32
+        indices = self.kv_selector.get_compressed_indices(req, recent_len)
         if indices is None:
             print(f"WARNING: No kv selected for request {req.rid}, loading all")
             self.kv_selector.restore_req(req)
             return self.load_back(req)
-        self.load_back(req, indices)
+        entry.compressed_len = len(indices)
+        self.token_to_kv_pool_host.update_synced(indices)
+        self.token_to_kv_pool_host.update_backup(indices)
+        self.load_back(req, torch.cat([indices, entry.full_host_value[-recent_len:]]))
+        print(f"INFO: Load back {req.rid} with selective loading, "
+              f"compressed length: {entry.compressed_len}, "
+              f"full host value length: {entry.full_host_value.shape[0]}")
 
     def load_check(self, req: Optional[Req] = None) -> Optional[bool]:
         # synchronize the loading status

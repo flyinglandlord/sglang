@@ -282,10 +282,10 @@ class MyRequestOffloadManager():
             for req in self.load_queue:
                 if self.is_req_ready_to_load(req[0]):
                     # assert self.sync_cache.can_load_back(req[0]), "A request cannot loadback in the Offload Manager"
-                    if len(req[0].output_ids) < 100:
+                    if len(req[0].output_ids) < 20:
                         self.sync_cache.load_back(req[0])
                     else:
-                        self.sync_cache.select_and_load_back(req[0], 900, True)
+                        self.sync_cache.load_back_selective(req[0], True)
                     filtered_in_load_queue.append(req)
             for req in filtered_in_load_queue:
                 self.load_queue.remove(req)
@@ -704,7 +704,7 @@ class MyScheduler(Scheduler):
         self.greedy_selection(schedule_decision, valid_thr)
 
         for req in schedule_decision.keep_running_list:
-            if len(req.origin_input_ids) + len(req.output_ids) > 1000 and len(req.output_ids) > 100:
+            if len(req.origin_input_ids) + len(req.output_ids) > 800 and len(req.output_ids) > 20:
                 print(f"evict {req.rid} for too long: {len(req.origin_input_ids)} {len(req.output_ids)}")
                 schedule_decision.remove_request(req)
 
