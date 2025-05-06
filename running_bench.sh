@@ -13,8 +13,8 @@ rm /mtc/chenjunyi/sglang/tmp/weight_log.log
 /mtc/yongyang/miniconda/envs/sgl_test/bin/python -m sglang.bench_serving  \
     --port 8000 \
     --backend sglang \
-    --num-prompts 500 \
+    --num-prompts 400 \
     --dataset-name random \
     --dataset-path /home/devsft/ShareGPT_V3_unfiltered_cleaned_split.json \
     --random-input 512 --random-output 4096 \
-    --sharegpt-output-len 2048  #--request-rate 10 # --profile #  \
+    --sharegpt-output-len 2048 # --request-rate 10 # --profile #  \

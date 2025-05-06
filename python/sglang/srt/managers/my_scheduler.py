@@ -714,11 +714,23 @@ class MyScheduler(Scheduler):
         # get the weighted token value
         v_token = self.get_token_value()
         # change the max running requests according to the output speed
-
-        max_serving_requests = 250
+        max_serving_requests = 200
         max_running_requests = 500
         # change the concurrent prefill batch size according to the system load
-        max_prefill_requests = 200
+        max_prefill_requests = 50
+        # collect the buffer size information of all serving requests
+        all_serving_reqs = []
+        if self.running_batch is not None:
+            for req in self.running_batch.reqs:
+                all_serving_reqs.append(req)
+        if self.waiting_queue is not None:
+            for req in self.waiting_queue:
+                if len(req.output_ids) > 0:
+                    all_serving_reqs.append(req)
+        all_serving_reqs.extend(self.offload_manager.get_all_evict_reqs())
+        all_serving_reqs.extend(self.offload_manager.get_all_load_reqs())
+        all_serving_reqs.extend([] if self.next_prefill_batch is None else self.next_prefill_batch)
+        # print('serving reqs', len(all_serving_reqs))
         # initialize the schedule decision from the previous batch
         schedule_decision = MyScheduleDecision(self.token_to_kv_pool, self.cum_buffer_size, self.output_speed,
                                             [] if self.running_batch is None else self.running_batch.reqs, 
@@ -734,22 +746,9 @@ class MyScheduler(Scheduler):
         load_time = self.tree_cache.get_loading_workload()[0] / self.tree_cache.get_loading_workload()[1]
         write_time = self.tree_cache.get_writing_workload()[0] / self.tree_cache.get_writing_workload()[1]
 
-        # collect the buffer size information of all serving requests
-        all_serving_reqs = []
-        if self.running_batch is not None:
-            for req in self.running_batch.reqs:
-                all_serving_reqs.append(req)
-        if self.waiting_queue is not None:
-            for req in self.waiting_queue:
-                if len(req.output_ids) > 0:
-                    all_serving_reqs.append(req)
-        all_serving_reqs.extend(self.offload_manager.get_all_evict_reqs())
-        all_serving_reqs.extend(self.offload_manager.get_all_load_reqs())
-        all_serving_reqs.extend([] if self.next_prefill_batch is None else self.next_prefill_batch)
-
         # process the serving requests based on the objective
         # print('avg_reschedule_time', self.avg_reschedule_time.get_average())
-        if len(self.waiting_queue) > 0:
+        if len(self.waiting_queue) > 0 and len(schedule_decision.keep_running_list) >= max_serving_requests * 0.8:
             running_queue_evict_candidate = []
             waiting_queue_run_candidate = []
             for req in schedule_decision.keep_running_list:
@@ -770,12 +769,6 @@ class MyScheduler(Scheduler):
                                                 self.tree_cache.get_writing_workload(req.rid)[0] / self.tree_cache.get_writing_workload(req.rid)[1])
                     waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", True))
                     #print(f'recompute {req_len}, {adjust_value}', file=open('tmp/weight_log.log', "a"))
-                elif len(all_serving_reqs) < max_serving_requests:
-                    adjust_value = (-v_token[req], self.estimate_recompute_cost(req))
-                    waiting_queue_run_candidate.append((req, req_len, adjust_value, "waiting", True))
-                    #print(f'prefill {req_len}, {adjust_value}', file=open('tmp/weight_log.log', "a"))
-                # else:
-                #     print(f'', file=open('tmp/weight_log.log', "a"))
             
             running_queue_evict_candidate = sorted(running_queue_evict_candidate, 
                                                 key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
@@ -795,6 +788,17 @@ class MyScheduler(Scheduler):
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
             # self.local_search(schedule_decision, v_token)
+        
+        if len(all_serving_reqs) < max_serving_requests:
+            prefill_candidate = []
+            for req in self.waiting_queue:
+                if len(req.output_ids) == 0:
+                    req_len = len(req.origin_input_ids) + len(req.output_ids)
+                    adjust_value = (-v_token[req], self.estimate_recompute_cost(req))
+                    prefill_candidate.append((req, req_len, adjust_value, "waiting", True))
+            prefill_candidate = sorted(prefill_candidate, key=lambda x: (x[1]))
+            prefill_candidate = prefill_candidate[:max_serving_requests - len(all_serving_reqs)]
+            self.greedy_selection(schedule_decision, valid_thr, candidates=prefill_candidate)
 
 
         # DEBUG: Print the detail of schedule decision to log

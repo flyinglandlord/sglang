@@ -826,8 +826,23 @@ async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
-    input_requests = iter(input_requests)
-    for request in input_requests:
+    length = len(input_requests)
+    input_requests_iter = iter(input_requests[:length//2])
+    for request in input_requests_iter:
+        yield request
+
+        if request_rate == float("inf"):
+            # If the request rate is infinity, then we don't need to wait.
+            continue
+
+        # Sample the request interval from the exponential distribution.
+        interval = np.random.exponential(1.0 / request_rate)
+        # The next request will be sent after the interval.
+        await asyncio.sleep(interval)
+    
+    await asyncio.sleep(10.0)
+    input_requests_iter = iter(input_requests[length//2:])
+    for request in input_requests_iter:
         yield request
 
         if request_rate == float("inf"):
