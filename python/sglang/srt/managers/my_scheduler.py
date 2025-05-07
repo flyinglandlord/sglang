@@ -121,7 +121,7 @@ class MyScheduleDecision():
         self.avail_prefill_tokens = self.max_prefill_tokens
         self.avail_prefill_requests = self.max_prefill_requests
 
-        self.new_token_ratio = new_token_ratio * 0.5
+        self.new_token_ratio = new_token_ratio * 0.6
 
         # self.initialize_keep_running_list()
     
@@ -367,6 +367,7 @@ class MyScheduler(Scheduler):
         self.last_load = False
         self.avg_reschedule_time = TimeWindowAverage(10.0)
         self.avg_prefill_time = TimeWindowAverage(10.0)
+        self.avg_decode_time = TimeWindowAverage(10.0)
 
         # Some custom scheduler config
         self.high_watermark_ratio = 5.0
@@ -375,7 +376,7 @@ class MyScheduler(Scheduler):
         self.log_batch_status = False
         self.runtime_check = False
         self.debug_log = False
-        self.buffer_conservativeness = 8.0
+        self.buffer_conservativeness = 2.0
     
     @torch.no_grad()
     def event_loop_normal(self):
@@ -433,11 +434,8 @@ class MyScheduler(Scheduler):
                     #torch.cuda.synchronize()
                     ed = time.time()
                     self.last_running_time = ed - st
-                    # if batch.forward_mode.is_decode():
-                    #     if self.avg_decode_time == 0.0:
-                    #         self.avg_decode_time = (ed - st)
-                    #     else:
-                    #         self.avg_decode_time = (self.avg_decode_time + (ed - st)) / 2
+                    if batch.forward_mode.is_decode():
+                        self.avg_decode_time.add_value((ed - st) / len(batch.reqs))
                     if batch.forward_mode.is_extend():
                         prefill_tokens = 0
                         for req in batch.reqs:
@@ -600,7 +598,7 @@ class MyScheduler(Scheduler):
                 if schedule_decision.can_add_request(req, recompute=recompute):
                     schedule_decision.add_request(req, recompute=recompute)
     
-    def local_search(self, schedule_decision, value, max_step=5):
+    def local_search(self, schedule_decision, value, working_set, max_step=5):
         # After greedy search, we can use local search to do some small change to schedule decision
         improved = True
         i = 0
@@ -621,7 +619,7 @@ class MyScheduler(Scheduler):
             # 尝试删除一个，加一个
             for remove_req in all_reqs:
                 for try_add_req in schedule_decision.running_reqs + schedule_decision.waiting_reqs:
-                    if try_add_req in all_reqs:
+                    if try_add_req in all_reqs or try_add_req not in working_set:
                         continue  # 跳过已在的或loading中的
                     # 尝试移除remove_req
                     removed_recompute = remove_req in schedule_decision.new_prefill_list
@@ -717,7 +715,7 @@ class MyScheduler(Scheduler):
         # get the weighted token value
         v_token = self.get_token_value()
         # change the max running requests according to the output speed
-        max_serving_requests = 150
+        max_serving_requests = 200
         max_running_requests = 500
         # change the concurrent prefill batch size according to the system setup
         max_prefill_requests = 50
@@ -735,7 +733,24 @@ class MyScheduler(Scheduler):
         all_serving_reqs.extend(self.offload_manager.get_all_evict_reqs())
         all_serving_reqs.extend(self.offload_manager.get_all_load_reqs())
         all_serving_reqs.extend([] if self.next_prefill_batch is None else self.next_prefill_batch)
-        # print('serving reqs', len(all_serving_reqs))
+        working_set = all_serving_reqs
+        avg_buffer_size = 0
+        total_output_speed = 0
+        if len(working_set) > 0:
+            for req in working_set:
+                avg_buffer_size += self.cum_buffer_size[req.rid]
+                total_output_speed += self.output_speed[req.rid]
+            avg_buffer_size /= len(working_set)
+        #working_set = sorted(working_set, key=lambda x: (-self.output_speed[x.rid], x.rid))
+        #working_set = working_set[:min(len(working_set), len_running_batch + 50)]
+        
+        last_batch_tokens = len(self.last_batch.reqs) if self.last_batch is not None else 0
+        if self.avg_decode_time.get_average() != 0:
+            last_throughput = last_batch_tokens / self.avg_decode_time.get_average()
+        else:
+            last_throughput = 0
+        
+
         # initialize the schedule decision from the previous batch
         schedule_decision = MyScheduleDecision(self.token_to_kv_pool, self.cum_buffer_size, self.output_speed,
                                             [] if self.running_batch is None else self.running_batch.reqs, 
@@ -750,14 +765,6 @@ class MyScheduler(Scheduler):
             valid_thr[req] = v_token[req] * self.reschedule_interval
         load_time = self.tree_cache.get_loading_workload()[0] / self.tree_cache.get_loading_workload()[1]
         write_time = self.tree_cache.get_writing_workload()[0] / self.tree_cache.get_writing_workload()[1]
-
-        working_set = all_serving_reqs
-        avg_buffer_size = 0
-        for req in working_set:
-            avg_buffer_size += self.cum_buffer_size[req.rid]
-        avg_buffer_size /= len(working_set)
-        #working_set = sorted(working_set, key=lambda x: (-self.output_speed[x.rid], x.rid))
-        #working_set = working_set[:min(len(working_set), len_running_batch + 50)]
 
         # process the serving requests based on the objective
         # print('avg_reschedule_time', self.avg_reschedule_time.get_average())
@@ -804,7 +811,7 @@ class MyScheduler(Scheduler):
                 self.req_last_run_time[x[0].rid]))
 
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
-            # self.local_search(schedule_decision, v_token)
+            self.local_search(schedule_decision, v_token, working_set)
         
         for req in working_set:
             if self.cum_buffer_size[req.rid] < self.output_speed[req.rid] * \

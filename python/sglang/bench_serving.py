@@ -320,7 +320,7 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
     # speed = 20.0
-    speed = random.choice([30.0, 30.0])
+    speed = random.choice([20.0, 20.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -329,7 +329,7 @@ async def async_request_sglang_generate(
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": True,
-                "output_speed": speed + 10,
+                "output_speed": speed + 20,
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
