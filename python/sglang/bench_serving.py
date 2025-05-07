@@ -320,7 +320,7 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
     # speed = 20.0
-    speed = random.choice([30.0, 30.0, 30.0, 30.0])
+    speed = random.choice([20.0, 20.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -329,7 +329,7 @@ async def async_request_sglang_generate(
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": True,
-                "output_speed": speed,
+                "output_speed": speed + 20,
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
@@ -827,21 +827,7 @@ async def get_request(
     request_rate: float,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
     length = len(input_requests)
-    input_requests_iter = iter(input_requests[:length//2])
-    for request in input_requests_iter:
-        yield request
-
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
-
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
-    
-    await asyncio.sleep(10.0)
-    input_requests_iter = iter(input_requests[length//2:])
+    input_requests_iter = iter(input_requests)
     for request in input_requests_iter:
         yield request
 
