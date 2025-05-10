@@ -319,8 +319,8 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
-    # speed = 20.0
-    speed = random.choice([20.0, 20.0])
+    speed = 25.0
+    # speed = random.choice([20.0, 20.0])
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -329,7 +329,7 @@ async def async_request_sglang_generate(
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": True,
-                "output_speed": speed + 20,
+                "output_speed": speed * 1.1,
             },
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
@@ -825,18 +825,24 @@ def sample_generated_shared_prefix_requests(
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    trace: Optional[List[float]] = None,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
     length = len(input_requests)
     input_requests_iter = iter(input_requests)
+    trace_iter = iter(trace) if trace is not None else None
     for request in input_requests_iter:
         yield request
 
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
-
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        if trace_iter is None:
+            if request_rate == float("inf"):
+                # If the request rate is infinity, then we don't need to wait.
+                continue
+            
+            # Sample the request interval from the exponential distribution.
+            interval = np.random.exponential(1.0 / request_rate)
+        else:
+            interval = next(trace_iter)
+        
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -933,6 +939,7 @@ async def benchmark(
     lora_name: str,
     extra_request_body: Dict[str, Any],
     profile: bool,
+    trace: Optional[List[float]],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -990,7 +997,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
+    async for request in get_request(input_requests, request_rate, trace):
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1280,6 +1287,19 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
+    trace = None
+    if args.use_trace is not None:
+        if not os.path.exists(args.use_trace):
+            print(f"Trace file {args.use_trace} does not exist.")
+            sys.exit(1)
+        with open(args.use_trace, "r") as f:
+            trace = list(map(float, f))
+            trace.sort()
+        trace = [(x - trace[0]) * args.trace_scale for x in trace]
+        args.num_prompts = min(args.num_prompts, len(trace))
+        print(f"Using trace file {args.use_trace} with scale {args.trace_scale}, now {args.num_prompts} requests.")
+        print(trace[:20])
+        
     print(f"{args}\n")
 
     # Read dataset
@@ -1306,6 +1326,7 @@ def run_benchmark(args_: argparse.Namespace):
                 lora_name=args.lora_name,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
+                trace=trace,
             )
         )
     else:
@@ -1327,6 +1348,7 @@ def run_benchmark(args_: argparse.Namespace):
                     lora_name=args.lora_name,
                     extra_request_body=extra_request_body,
                     profile=args.profile,
+                    trace=trace,
                 )
             )
 
@@ -1530,6 +1552,18 @@ if __name__ == "__main__":
         type=int,
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--use-trace",
+        type=str,
+        default=None,
+        help="The path to the trace file for benchmarking. "
+    )
+    group.add_argument(
+        "--trace-scale",
+        type=float,
+        default=1.0,
+        help="The scale of the trace file for benchmarking. "
     )
     args = parser.parse_args()
     run_benchmark(args)
