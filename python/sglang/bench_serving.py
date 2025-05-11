@@ -19,6 +19,7 @@ import pickle
 import random
 import resource
 import sys
+import csv
 import time
 import traceback
 import warnings
@@ -464,7 +465,7 @@ def get_tokenizer(
     )
 
 
-def get_dataset(args, tokenizer):
+def get_dataset(args, tokenizer, request_length_list):
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
@@ -491,6 +492,13 @@ def get_dataset(args, tokenizer):
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
             tokenizer=tokenizer,
+        )
+    elif args.dataset_name == "burstgpt":
+        input_requests = sample_burstgpt_requests(
+            num_prompts=args.num_prompts,
+            tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
+            request_length_list=request_length_list,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -727,6 +735,63 @@ def sample_random_requests(
     return input_requests
 
 
+def sample_burstgpt_requests(
+    num_prompts: int,
+    tokenizer: PreTrainedTokenizerBase,
+    dataset_path: str,
+    request_length_list: List[Tuple[int, int]],
+) -> List[Tuple[str, int, int]]:
+
+    input_lens = [x[0] for x in request_length_list]
+    output_lens = [x[1] for x in request_length_list]
+
+    # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
+
+    # Download sharegpt if necessary
+    if not os.path.isfile(dataset_path):
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
+
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+    # Filter out the conversations with less than 2 turns.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+    # Only keep the first two turns of each conversation.
+    dataset = [
+        (data["conversations"][0]["value"], data["conversations"][1]["value"])
+        for data in dataset
+    ]
+    # Shuffle the dataset.
+    random.shuffle(dataset)
+
+    # Filter out sequences that are too long or too short
+    input_requests: List[Tuple[str, int, int]] = []
+    for data in dataset:
+        i = len(input_requests)
+        if i == num_prompts:
+            break
+
+        # Tokenize the prompts and completions.
+        prompt = data[0]
+        prompt_token_ids = tokenizer.encode(prompt)
+        prompt_len = len(prompt_token_ids)
+
+        # Skip empty prompt
+        if prompt_len == 0:
+            continue
+
+        if prompt_len > input_lens[i]:
+            input_ids = prompt_token_ids[: input_lens[i]]
+        else:
+            ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+            input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+        prompt = tokenizer.decode(input_ids)
+        input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+
+    print(f"#Input tokens: {np.sum(input_lens)}")
+    print(f"#Output tokens: {np.sum(output_lens)}")
+    return input_requests
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
@@ -830,6 +895,7 @@ async def get_request(
     length = len(input_requests)
     input_requests_iter = iter(input_requests)
     trace_iter = iter(trace) if trace is not None else None
+    last_timestamp = 0.0
     for request in input_requests_iter:
         yield request
 
@@ -841,7 +907,9 @@ async def get_request(
             # Sample the request interval from the exponential distribution.
             interval = np.random.exponential(1.0 / request_rate)
         else:
-            interval = next(trace_iter)
+            timestamp = next(trace_iter)
+            interval = timestamp - last_timestamp
+            last_timestamp = timestamp
         
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
@@ -1288,17 +1356,37 @@ def run_benchmark(args_: argparse.Namespace):
         )
 
     trace = None
+    request_length_list = None
     if args.use_trace is not None:
         if not os.path.exists(args.use_trace):
             print(f"Trace file {args.use_trace} does not exist.")
             sys.exit(1)
-        with open(args.use_trace, "r") as f:
-            trace = list(map(float, f))
-            trace.sort()
+        if args.use_trace.endswith(".log"):
+            with open(args.use_trace, "r") as f:
+                trace = list(map(float, f))
+                trace = trace[:int(len(trace) / 3)] # prune the trace here
+                trace = random.sample(trace, args.num_prompts)
+                trace.sort()
+        elif args.use_trace.endswith(".csv"):
+            with open(args.use_trace, "r") as f:
+                reader = csv.reader(f)
+                _ = next(reader)  # Skip header
+                trace = []
+                for _, row in zip(range(10000), reader): # prune the trace here
+                    row[0] = float(row[0])
+                    trace.append(row)
+                trace = random.sample(trace, args.num_prompts)
+                trace.sort()
+                request_length_list = [(int(x[2]), int(x[3])) for x in trace]
+                trace = [float(x[0]) for x in trace]
+        else:
+            print(f"Unsupported trace file format: {args.use_trace}")
+            sys.exit(1)
         trace = [(x - trace[0]) * args.trace_scale for x in trace]
-        args.num_prompts = min(args.num_prompts, len(trace))
-        print(f"Using trace file {args.use_trace} with scale {args.trace_scale}, now {args.num_prompts} requests.")
-        print(trace[:20])
+        trace.pop(0)  # remove the first element
+        trace.append(trace[-1])  # add a dummy element to the end
+        print(f"Using trace file {args.use_trace} with scale {args.trace_scale}, trace length: {len(trace)}")
+        print(f"Trace: {trace[:20]}...")
         
     print(f"{args}\n")
 
@@ -1309,7 +1397,7 @@ def run_benchmark(args_: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id)
 
-    input_requests = get_dataset(args, tokenizer)
+    input_requests = get_dataset(args, tokenizer, request_length_list)
 
     if not args.multi:
         return asyncio.run(
@@ -1391,7 +1479,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix"],
+        choices=["sharegpt", "random", "generated-shared-prefix", "burstgpt"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
