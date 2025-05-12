@@ -33,10 +33,10 @@ class AndesScheduler(Scheduler):
         self.log_batch_status = False
         self.virtual_buffer_size = {}
         self.decode_time_stamp = {}
-        self.output_speed = 25
+        self.output_speed = 20
         self.avg_decode_time = 0.01
         self.avg_prefill_time = 0.1
-        self.reschedule_interval = 0.5
+        self.reschedule_interval = 3.0
         self.last_reschedule_time = None
         self.selected_Q_service = {}
         self.selected_Q_wait = {}
@@ -328,7 +328,7 @@ class AndesScheduler(Scheduler):
 
         
     def reschedule_requests(self):
-        print('======Reschedule the requests======')
+        # print('======Reschedule the requests======')
         # Try different batch size
         max_qoe_gain = -100000
         max_selected = None

@@ -121,7 +121,7 @@ class MyScheduleDecision():
         self.avail_prefill_tokens = self.max_prefill_tokens
         self.avail_prefill_requests = self.max_prefill_requests
 
-        self.new_token_ratio = new_token_ratio * 0.6
+        self.new_token_ratio = new_token_ratio * 0.5
 
         # self.initialize_keep_running_list()
     
@@ -293,7 +293,7 @@ class MyRequestOffloadManager():
 
     def step(self):
         # if len(self.load_queue) > 0 or len(self.evict_queue) > 0:
-        #     print(f"load wait queue: {len(self.load_queue)}, loading queue: {len(self.loading_queue)}, evicting queue: {len(self.evicting_queue)}", file=open('tmp/offload_log.log', 'a'))
+        #     print(f"load wait queue: {len(self.load_queue)}, loading queue: {len(self.loading_queue)}, evicting queue: {len(self.evicting_queue)}")
         #     print('predict evict time', self.sync_cache.get_writing_workload(), file=open('tmp/offload_log.log', 'a'))
         #     print('predict load time', self.sync_cache.get_loading_workload(), file=open('tmp/offload_log.log', 'a'))
         # NOTE: Later we can adopt more fine-grained offload strategy
@@ -372,11 +372,11 @@ class MyScheduler(Scheduler):
         # Some custom scheduler config
         self.high_watermark_ratio = 5.0
         self.low_watermark_ratio = 1.0
-        self.reschedule_interval = 1.0
+        self.reschedule_interval = 0.5
         self.log_batch_status = False
         self.runtime_check = False
         self.debug_log = False
-        self.buffer_conservativeness = 2.0
+        self.buffer_conservativeness = 0.1
     
     @torch.no_grad()
     def event_loop_normal(self):
@@ -668,7 +668,7 @@ class MyScheduler(Scheduler):
                 for req in self.waiting_queue:
                     final_buffer_size = self.cum_buffer_size[req.rid] - \
                         min(self.estimate_load_cost(req), self.estimate_recompute_cost(req)) * self.output_speed[req.rid] - \
-                        self.output_speed[req.rid] * self.reschedule_interval * self.buffer_conservativeness
+                        self.output_speed[req.rid] * self.reschedule_interval
                     max_buffer_size = max(max_buffer_size, final_buffer_size)
                     min_buffer_size = min(min_buffer_size, final_buffer_size)
             
@@ -715,10 +715,10 @@ class MyScheduler(Scheduler):
         # get the weighted token value
         v_token = self.get_token_value()
         # change the max running requests according to the output speed
-        max_serving_requests = 200
+        max_serving_requests = 400
         max_running_requests = 500
         # change the concurrent prefill batch size according to the system setup
-        max_prefill_requests = 50
+        max_prefill_requests = 100
         # collect the buffer size information of all serving requests
         all_serving_reqs = []
         len_running_batch = 0
@@ -768,12 +768,13 @@ class MyScheduler(Scheduler):
 
         # process the serving requests based on the objective
         # print('avg_reschedule_time', self.avg_reschedule_time.get_average())
-        if len(self.waiting_queue) > 0:
+        if len(self.waiting_queue) > 0 and (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval):
+            self.last_schedule = time.time()
             running_queue_evict_candidate = []
             waiting_queue_run_candidate = []
             for req in schedule_decision.keep_running_list:
                 if self.cum_buffer_size[req.rid] >= self.output_speed[req.rid] * \
-                    max(load_time + write_time + self.reschedule_interval, self.avg_reschedule_time.get_average()) * self.buffer_conservativeness:
+                    (load_time + write_time + self.reschedule_interval) * self.buffer_conservativeness:
                     running_queue_evict_candidate.append(req)
                     # print(self.cum_buffer_size[req.rid], v_token[req])
             for req in working_set:
@@ -793,7 +794,7 @@ class MyScheduler(Scheduler):
             
             running_queue_evict_candidate = sorted(running_queue_evict_candidate, 
                                                 key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
-            evict_num = int(len(running_queue_evict_candidate) * 0.5)
+            evict_num = int(len(running_queue_evict_candidate) * 0.2)
             running_queue_evict_candidate = running_queue_evict_candidate[-evict_num:]
 
             for req in running_queue_evict_candidate:
@@ -973,11 +974,9 @@ class MyScheduler(Scheduler):
                         print('j', len(self.req_to_token_pool.req_to_token[self.running_batch.reqs[j].req_pool_idx, :self.running_batch.seq_lens[j]]))
                         assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
     
-        if (self.last_schedule is None or time.time() - self.last_schedule >= self.reschedule_interval):
+        if True:
             #print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
             #print("Load/Evict/Prefill:", len(self.offload_manager.get_all_load_reqs()), len(self.offload_manager.get_all_evict_reqs()), len(self.next_prefill_batch) if self.next_prefill_batch is not None else 0)
-            
-            self.last_schedule = time.time()
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens_cpu.numpy()
                 before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
