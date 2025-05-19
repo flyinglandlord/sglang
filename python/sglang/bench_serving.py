@@ -1372,9 +1372,10 @@ def run_benchmark(args_: argparse.Namespace):
                 reader = csv.reader(f)
                 _ = next(reader)  # Skip header
                 trace = []
-                for _, row in zip(range(10000), reader): # prune the trace here
-                    row[0] = float(row[0])
-                    trace.append(row)
+                for _, row in zip(range(1000, 2001), reader): # prune the trace here
+                    if int(row[2]) > 0 and int(row[3]) > 0:
+                        row[0] = float(row[0])
+                        trace.append(row)
                 trace = random.sample(trace, args.num_prompts)
                 trace.sort()
                 request_length_list = [(int(x[2]), int(x[3])) for x in trace]

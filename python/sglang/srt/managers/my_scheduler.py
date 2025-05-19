@@ -121,7 +121,7 @@ class MyScheduleDecision():
         self.avail_prefill_tokens = self.max_prefill_tokens
         self.avail_prefill_requests = self.max_prefill_requests
 
-        self.new_token_ratio = new_token_ratio * 0.5
+        self.new_token_ratio = new_token_ratio * 0.3
 
         # self.initialize_keep_running_list()
     
@@ -376,7 +376,7 @@ class MyScheduler(Scheduler):
         self.log_batch_status = False
         self.runtime_check = False
         self.debug_log = False
-        self.buffer_conservativeness = 0.1
+        self.buffer_conservativeness = 50.0
     
     @torch.no_grad()
     def event_loop_normal(self):
@@ -715,11 +715,10 @@ class MyScheduler(Scheduler):
         # get the weighted token value
         v_token = self.get_token_value()
         # change the max running requests according to the output speed
-        max_serving_requests = 400
-        max_running_requests = 500
+        max_serving_requests = 500
+        max_running_requests = 1000
         # change the concurrent prefill batch size according to the system setup
-        max_prefill_requests = 100
-        # collect the buffer size information of all serving requests
+        max_prefill_requests = 50       # collect the buffer size information of all serving requests
         all_serving_reqs = []
         len_running_batch = 0
         if self.running_batch is not None:
@@ -794,7 +793,7 @@ class MyScheduler(Scheduler):
             
             running_queue_evict_candidate = sorted(running_queue_evict_candidate, 
                                                 key=lambda x: (self.cum_buffer_size[x.rid], -self.output_speed[x.rid]))
-            evict_num = int(len(running_queue_evict_candidate) * 0.2)
+            evict_num = int(len(running_queue_evict_candidate) * 0.05)
             running_queue_evict_candidate = running_queue_evict_candidate[-evict_num:]
 
             for req in running_queue_evict_candidate:
@@ -814,10 +813,10 @@ class MyScheduler(Scheduler):
             self.greedy_selection(schedule_decision, valid_thr, candidates=waiting_queue_run_candidate)
             self.local_search(schedule_decision, v_token, working_set)
         
-        for req in working_set:
-            if self.cum_buffer_size[req.rid] < self.output_speed[req.rid] * \
-                    max(load_time + write_time + self.reschedule_interval, self.avg_reschedule_time.get_average()) * self.buffer_conservativeness:
-                return schedule_decision
+        # for req in working_set:
+        #     if self.cum_buffer_size[req.rid] < self.output_speed[req.rid] * \
+        #             max(load_time + write_time + self.reschedule_interval, self.avg_reschedule_time.get_average()) * 0.1:
+        #         return schedule_decision
         
         if len(all_serving_reqs) < max_serving_requests:
             prefill_candidate = []
@@ -975,8 +974,8 @@ class MyScheduler(Scheduler):
                         assert False, f"two running request {self.running_batch.reqs[i].rid} and {self.running_batch.reqs[j].rid} share the same token slots"
     
         if True:
-            #print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
-            #print("Load/Evict/Prefill:", len(self.offload_manager.get_all_load_reqs()), len(self.offload_manager.get_all_evict_reqs()), len(self.next_prefill_batch) if self.next_prefill_batch is not None else 0)
+            # print("Write waiting:", self.tree_cache.write_token_num, self.tree_cache.wrote_token_num, len(self.tree_cache.get_evicting_reqs()))
+            # print("Load/Evict/Prefill:", len(self.offload_manager.get_all_load_reqs()), len(self.offload_manager.get_all_evict_reqs()), len(self.next_prefill_batch) if self.next_prefill_batch is not None else 0)
             if self.running_batch is not None:
                 seq_lens_cpu = self.running_batch.seq_lens_cpu.numpy()
                 before_req_nums = len(self.running_batch.reqs) + len(self.waiting_queue) + self.offload_manager.get_total_reqs()
